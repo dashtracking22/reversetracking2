@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Reverse — The Odds Tracking App</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="./styles.css" rel="stylesheet" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand">Reverse — The Odds Tracking App</div>
+    <div class="toolbar">
+      <label class="field">
+        <span>Sport</span>
+        <select id="sportSelect"><option>Loading…</option></select>
+      </label>
+
+      <label class="field">
+        <span>Bookmaker</span>
+        <select id="bookmakerSelect">
+          <option value="betonlineag">BetOnline</option>
+          <option value="draftkings">DraftKings</option>
+          <option value="fanduel">FanDuel</option>
+          <option value="betmgm">BetMGM</option>
+          <option value="caesars">Caesars</option>
+          <option value="custom">Custom…</option>
+        </select>
+      </label>
+
+      <label class="field hidden" id="customBookWrap">
+        <span>Custom Book</span>
+        <input id="customBookInput" placeholder="e.g., pointsbetus" />
+      </label>
+
+      <button id="refreshBtn" class="btn">Load Odds</button>
+    </div>
+  </header>
+
+  <!-- Day scroller -->
+  <div class="daybar">
+    <div id="dayScroller" class="day-scroller" role="tablist" aria-label="Select day"></div>
+  </div>
+
+  <div class="subbar">
+    <div id="status" class="status">Pick a sport and click Load Odds</div>
+    <div id="meta" class="meta"></div>
+  </div>
+
+  <main class="container">
+    <div id="games" class="games"></div>
+  </main>
+
+  <footer class="footer">
+    <div>Moneyline diff = price delta (¢). Spread/Total diff = point movement only.</div>
+    <div class="copyright">© 2025 Reverse — The Odds Tracking App</div>
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>
