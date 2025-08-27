@@ -1,267 +1,41 @@
-const sportSelect = document.getElementById("sportSelect");
-const bookmakerSelect = document.getElementById("bookmakerSelect");
-const customBookWrap = document.getElementById("customBookWrap");
-const customBookInput = document.getElementById("customBookInput");
-const refreshBtn = document.getElementById("refreshBtn");
-const statusBox = document.getElementById("status");
-const metaBox = document.getElementById("meta");
-const gamesEl = document.getElementById("games");
-const dayScroller = document.getElementById("dayScroller");
+// app.js — Reverse Odds Tracker
+const API_BASE = ""; // same origin on Render
 
-// Pretty labels for sport keys
-const SPORT_LABELS = {
-  baseball_mlb: "MLB",
-  mma_mixed_martial_arts: "MMA",
-  basketball_wnba: "WNBA",
-  americanfootball_nfl: "NFL",
-  americanfootball_ncaaf: "NCAAF",
+const els = {
+  sport: document.getElementById("sportSelect"),
+  book: document.getElementById("bookmakerSelect"),
+  customBookWrap: document.getElementById("customBookWrap"),
+  customBookInput: document.getElementById("customBookInput"),
+  refresh: document.getElementById("refreshBtn"),
+  status: document.getElementById("status"),
+  meta: document.getElementById("meta"),
+  games: document.getElementById("games"),
+  dayScroller: document.getElementById("dayScroller"),
 };
 
-// Allow opening index.html from disk while still calling the API
-const API_BASE = location.origin.startsWith("file:") ? "http://127.0.0.1:5050" : "";
+function fmtOdd(n){if(n==null)return"—";const x=+n;if(isNaN(x))return"—";return x>0?`+${x}`:`${x}`;}
+function fmtPoint(n){if(n==null)return"—";const x=+n;if(isNaN(x))return"—";return x>0?`+${x}`:`${x}`;}
+function diffClass(n){if(n==null)return"zero";const x=+n;if(isNaN(x)||x===0)return"zero";return x>0?"pos":"neg";}
+function fmtDiff(n){if(n==null)return"—";const x=+n;if(isNaN(x))return"—";return x>0?`+${x}`:`${x}`;}
 
-// --- state
-let selectedDateKey = null;   // 'YYYY-MM-DD' local date key for filtering
-let lastLoadedGames = [];     // cache latest fetch so changing day is instant
+async function fetchJSON(u){const r=await fetch(u);if(!r.ok)throw Error(`HTTP ${r.status}`);return r.json();}
 
-// --- helpers
-const setStatus = (msg) => { statusBox.textContent = msg; };
-const setMeta = (msg) => { metaBox.textContent = msg || ""; };
-const fmtAmerican = (v) => v == null ? "-" : (v > 0 ? `+${v}` : `${v}`);
-const fmtPoint = (v) => (v == null ? "-" : (Number(v) > 0 ? `+${Number(v)}` : `${Number(v)}`));
-const fmtDiffPts = (v) => (v == null ? "-" : `${v > 0 ? "+" : ""}${Number(v).toFixed(1)}`);
-const fmtISOToLocal = (iso) => {
-  if (!iso) return "-";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-  } catch { return iso; }
-};
-function localDateKeyFromISO(iso) {
-  const d = new Date(iso);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-function localKeyFromDate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+async function loadSports(){const d=await fetchJSON(`${API_BASE}/sports`);els.sport.innerHTML="";for(const s of d.sports||[]){const o=document.createElement("option");o.value=s.key;o.textContent=s.label;els.sport.appendChild(o);}}
 
-async function fetchJSON(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch {
-    throw new Error(`Non-JSON from ${url}: ${text.slice(0, 180)}`);
-  }
-  if (!res.ok) {
-    const detail = json.error || JSON.stringify(json).slice(0, 180);
-    throw new Error(`HTTP ${res.status} for ${url}: ${detail}`);
-  }
-  return json;
-}
+function setStatus(t){els.status.textContent=t;} function setMeta(t){els.meta.textContent=t;}
+function setCustomBookVisibility(){const v=els.book.value;if(v==="custom"){els.customBookWrap.classList.remove("hidden");}else{els.customBookWrap.classList.add("hidden");els.customBookInput.value="";}}
 
-// --- init sports
-async function initSports() {
-  setStatus("Loading sports…");
-  try {
-    const data = await fetchJSON(`${API_BASE}/sports`);
-    const sports = data.sports || [];
-    sportSelect.innerHTML = "";
-    for (const s of sports) {
-      const opt = document.createElement("option");
-      opt.value = s;                         // keep API key as value
-      opt.textContent = SPORT_LABELS[s] || s; // show pretty label
-      sportSelect.appendChild(opt);
-    }
-    setStatus("Pick a sport and click Load Odds");
-  } catch (err) {
-    sportSelect.innerHTML = `<option value="">(failed)</option>`;
-    setStatus(`Failed to load sports → ${err.message}`);
-  }
-}
+function renderDayScroller(){els.dayScroller.innerHTML="";const now=new Date();for(let i=0;i<7;i++){const d=new Date(now);d.setDate(now.getDate()+i);const label=d.toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"});const b=document.createElement("button");b.className=`day-pill${i===0?" active":""}`;b.textContent=label;b.type="button";b.onclick=()=>{document.querySelectorAll(".day-pill").forEach(el=>el.classList.remove("active"));b.classList.add("active");};els.dayScroller.appendChild(b);}}
 
-// --- day scroller
-function buildDayScroller(days = 12) {
-  dayScroller.innerHTML = "";
-  const now = new Date();
-  for (let i = 0; i < days; i++) {
-    const d = new Date(now);
-    d.setDate(now.getDate() + i);
-    const key = localKeyFromDate(d);
-    const label = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+function sectionHeaderRow(){return `<div class="grid"><div class="col-head">Team</div><div class="col-head">Open</div><div class="col-head">Live</div><div class="col-head">Diff</div></div>`;}
 
-    const btn = document.createElement("button");
-    btn.className = "day-pill";
-    btn.setAttribute("role", "tab");
-    btn.dataset.key = key;
-    btn.textContent = label;
-    btn.addEventListener("click", () => {
-      setSelectedDay(key);
-      renderGamesForSelectedDay();
-    });
-    dayScroller.appendChild(btn);
-  }
-  setSelectedDay(localKeyFromDate(now)); // today
-}
+function renderGameCard(g){
+  const ml=(g.moneyline||[]).map(r=>`<div class="grid"><div class="col">${r.team}</div><div class="col">${fmtOdd(r.open_price)}</div><div class="col">${fmtOdd(r.live_price)}</div><div class="col ${diffClass(r.diff_price)}">${fmtDiff(r.diff_price)}</div></div>`).join("");
+  const sp=(g.spreads||[]).map(r=>{const o=r.open_point!=null?`${fmtPoint(r.open_point)} (${fmtOdd(r.open_price)})`:"—";const l=r.live_point!=null?`${fmtPoint(r.live_point)} (${fmtOdd(r.live_price)})`:"—";return `<div class="grid"><div class="col">${r.team}</div><div class="col">${o}</div><div class="col">${l}</div><div class="col ${diffClass(r.diff_point)}">${fmtDiff(r.diff_point)}</div></div>`;}).join("");
+  const tot=(g.totals||[]).map(r=>{const o=r.open_point!=null?`${fmtPoint(r.open_point)} (${fmtOdd(r.open_price)})`:"—";const l=r.live_point!=null?`${fmtPoint(r.live_point)} (${fmtOdd(r.live_price)})`:"—";return `<div class="grid"><div class="col">${r.team}</div><div class="col">${o}</div><div class="col">${l}</div><div class="col ${diffClass(r.diff_point)}">${fmtDiff(r.diff_point)}</div></div>`;}).join("");
+  return `<div class="game-card"><div class="game-header"><div class="matchup">${g.away_team} <span class="at">@</span> ${g.home_team}</div><div class="kick">${g.commence_time_est||""}</div></div><div class="section"><div class="section-title">Moneyline</div>${sectionHeaderRow()}${ml}</div><div class="section"><div class="section-title">Spread</div>${sectionHeaderRow()}${sp}</div><div class="section"><div class="section-title">Total</div>${sectionHeaderRow()}${tot}</div></div>`;}
 
-function setSelectedDay(key) {
-  selectedDateKey = key;
-  Array.from(dayScroller.querySelectorAll(".day-pill")).forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.key === key);
-  });
-}
+async function loadOdds(){const sport=els.sport.value;let bm=els.book.value;if(bm==="custom")bm=els.customBookInput.value.trim()||"betonlineag";setStatus(`Loading ${sport} odds...`);els.games.innerHTML="";try{const d=await fetchJSON(`${API_BASE}/odds/${sport}?bookmaker=${bm}`);setMeta(`As of ${d.as_of_est}, book: ${d.bookmaker}`);setStatus("");els.games.innerHTML=d.games.map(renderGameCard).join("");}catch(e){console.error(e);setStatus("Error loading odds.");}}
 
-// --- rendering
-function renderGameHTML(g) {
-  const mlRows = g.moneyline ? Object.entries(g.moneyline).map(([team, v]) => {
-    const diff = v.diff;
-    const cls = typeof diff === "number" ? (diff < 0 ? "neg" : diff > 0 ? "pos" : "zero") : "";
-    return `
-      <div class="col">${team}</div>
-      <div class="col">${fmtAmerican(v.open)}</div>
-      <div class="col">${fmtAmerican(v.live)}</div>
-      <div class="col ${cls}">${diff == null ? "-" : `${diff > 0 ? "+" : ""}${diff}`}</div>
-    `;
-  }).join("") : `<div class="col">—</div><div class="col">—</div><div class="col">—</div><div class="col">—</div>`;
-
-  const spRows = g.spread ? Object.entries(g.spread).map(([team, v]) => {
-    const d = v.diff_points;
-    const cls = typeof d === "number" ? (d < 0 ? "neg" : d > 0 ? "pos" : "zero") : "";
-    return `
-      <div class="col">${team}</div>
-      <div class="col">${fmtPoint(v.open_point)} (${fmtAmerican(v.open_price)})</div>
-      <div class="col">${fmtPoint(v.live_point)} (${fmtAmerican(v.live_price)})</div>
-      <div class="col ${cls}">${d == null ? "-" : fmtDiffPts(d)}</div>
-    `;
-  }).join("") : `<div class="col">—</div><div class="col">—</div><div class="col">—</div><div class="col">—</div>`;
-
-  const tlRows = ["Over","Under"].map(side => {
-    const v = g.total?.[side];
-    if (!v) return "";
-    const d = v.diff_points;
-    const cls = typeof d === "number" ? (d < 0 ? "neg" : d > 0 ? "pos" : "zero") : "";
-    return `
-      <div class="col">${side}</div>
-      <div class="col">${fmtPoint(v.open_point)} (${fmtAmerican(v.open_price)})</div>
-      <div class="col">${fmtPoint(v.live_point)} (${fmtAmerican(v.live_price)})</div>
-      <div class="col ${cls}">${d == null ? "-" : fmtDiffPts(d)}</div>
-    `;
-  }).join("") || `<div class="col">—</div><div class="col">—</div><div class="col">—</div><div class="col">—</div>`;
-
-  return `
-  <div class="game-card">
-    <div class="game-header">
-      <div class="matchup">
-        <span class="away">${g.away || "TBD"}</span>
-        <span class="at">@</span>
-        <span class="home">${g.home || "TBD"}</span>
-      </div>
-      <div class="kick">Start: ${fmtISOToLocal(g.commence_time)}</div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Moneyline</div>
-      <div class="grid">
-        <div class="col col-head">Side</div>
-        <div class="col col-head">Open</div>
-        <div class="col col-head">Live</div>
-        <div class="col col-head">Diff</div>
-        ${mlRows}
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Spread</div>
-      <div class="grid">
-        <div class="col col-head">Side</div>
-        <div class="col col-head">Open</div>
-        <div class="col col-head">Live</div>
-        <div class="col col-head">Diff</div>
-        ${spRows}
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Total</div>
-      <div class="grid">
-        <div class="col col-head">Side</div>
-        <div class="col col-head">Open</div>
-        <div class="col col-head">Live</div>
-        <div class="col col-head">Diff</div>
-        ${tlRows}
-      </div>
-    </div>
-  </div>`;
-}
-
-function renderGamesForSelectedDay() {
-  if (!lastLoadedGames.length) {
-    gamesEl.innerHTML = "";
-    setStatus("No games loaded yet.");
-    return;
-  }
-  const filtered = selectedDateKey
-    ? lastLoadedGames.filter(g => localDateKeyFromISO(g.commence_time) === selectedDateKey)
-    : lastLoadedGames;
-
-  if (!filtered.length) {
-    gamesEl.innerHTML = "";
-    setStatus("No games for that day (try another day or bookmaker).");
-    setMeta("");
-    return;
-  }
-
-  setStatus(`Showing ${filtered.length} game${filtered.length === 1 ? "" : "s"} for ${selectedDateKey}`);
-  gamesEl.innerHTML = filtered.map(renderGameHTML).join("");
-}
-
-// --- loading odds
-async function loadOdds() {
-  let bookmaker = bookmakerSelect.value;
-  if (bookmaker === "custom") {
-    const custom = (customBookInput.value || "").trim();
-    if (!custom) { setStatus("Enter a custom bookmaker or choose a preset."); return; }
-    bookmaker = custom;
-  }
-  const sport = sportSelect.value;
-  if (!sport) return setStatus("Pick a sport first.");
-
-  gamesEl.innerHTML = "";
-  setStatus(`Loading ${sport} from ${bookmaker}…`);
-  setMeta("");
-
-  const t0 = Date.now();
-  try {
-    const json = await fetchJSON(`${API_BASE}/odds/${encodeURIComponent(sport)}?bookmaker=${encodeURIComponent(bookmaker)}`);
-    lastLoadedGames = json.results || [];
-    const took = ((Date.now() - t0) / 1000).toFixed(1);
-    setMeta(`Book: ${json.bookmaker} • Games: ${lastLoadedGames.length} • Loaded in ${took}s • ${new Date().toLocaleTimeString()}`);
-
-    if (!lastLoadedGames.length) {
-      setStatus(`No games/lines returned. Try a different bookmaker or sport.`);
-      return;
-    }
-    renderGamesForSelectedDay();
-  } catch (err) {
-    setStatus(`Failed to load odds → ${err.message}`);
-  }
-}
-
-// Toggle custom bookmaker input
-bookmakerSelect.addEventListener("change", () => {
-  const showCustom = bookmakerSelect.value === "custom";
-  customBookWrap.classList.toggle("hidden", !showCustom);
-  if (showCustom) customBookInput.focus();
-});
-
-// Events
-refreshBtn.addEventListener("click", loadOdds);
-window.addEventListener("DOMContentLoaded", () => {
-  initSports();
-  buildDayScroller(12); // today + 11 more days
-});
+function init(){loadSports();renderDayScroller();els.book.onchange=setCustomBookVisibility;els.refresh.onclick=loadOdds;}
+document.addEventListener("DOMContentLoaded",init);
