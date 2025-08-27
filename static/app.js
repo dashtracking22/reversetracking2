@@ -10,15 +10,14 @@ let currentDayOffset = 0;
 init();
 
 async function init(){
-  makeDateChips();
-  await populateSports();
-  await populateBookmakers();
+  buildDateChips();
+  await hydrateSports();
+  await hydrateBookmakers();
   loadBtn.addEventListener("click", loadOdds);
   await loadOdds();
 }
 
-function makeDateChips(){
-  // 6 chips: today + next 5 days
+function buildDateChips(){
   dateChips.innerHTML = "";
   const now = new Date();
   for(let i=0;i<6;i++){
@@ -36,84 +35,67 @@ function makeDateChips(){
   }
 }
 
-async function populateSports(){
+async function hydrateSports(){
   const r = await fetch("/sports");
   const data = await r.json();
   sportSelect.innerHTML = "";
   (data.sports || []).forEach(s=>{
     const opt = document.createElement("option");
-    opt.value = s; opt.textContent = labelizeSport(s);
+    opt.value = s;
+    opt.textContent = labelSport(s);
     sportSelect.appendChild(opt);
   });
+  if (data.default) sportSelect.value = data.default;
 }
 
-async function populateBookmakers(){
+async function hydrateBookmakers(){
   const r = await fetch("/bookmakers");
   const data = await r.json();
   bookmakerSelect.innerHTML = "";
   (data.bookmakers || []).forEach(b=>{
     const opt = document.createElement("option");
-    opt.value = b; opt.textContent = titleCase(b);
+    opt.value = b;
+    opt.textContent = titleCase(b);
     bookmakerSelect.appendChild(opt);
   });
-  if(data.default){
-    bookmakerSelect.value = data.default;
-  }
+  if (data.default) bookmakerSelect.value = data.default;
 }
 
 async function loadOdds(){
   cards.innerHTML = `<div class="badge">Loading…</div>`;
   try{
-    const params = new URLSearchParams({
+    const qs = new URLSearchParams({
       sport: sportSelect.value,
       bookmaker: bookmakerSelect.value,
-      day_offset: String(currentDayOffset)
+      day_offset: String(currentDayOffset),
     });
-    const r = await fetch(`/odds?${params.toString()}`);
+    const r = await fetch(`/odds?${qs.toString()}`);
     const data = await r.json();
-    if(!r.ok){
-      throw new Error(data.error || "Failed to load odds");
-    }
-    renderOdds(data);
+    if (!r.ok) throw new Error(data.error || "Failed to load odds");
+    render(data);
   }catch(err){
     cards.innerHTML = `<div class="badge">Error: ${err.message}</div>`;
   }
 }
 
-function renderOdds(payload){
+function render(payload){
   asOfText.textContent = `As of ${payload.as_of_est}, book: ${titleCase(payload.bookmaker)}`;
   const games = payload.games || [];
-  if(games.length === 0){
+  if (!games.length){
     cards.innerHTML = `<div class="badge">No games found for selected day.</div>`;
     return;
   }
-
-  cards.innerHTML = games.map(g => renderCard(g)).join("");
+  cards.innerHTML = games.map(renderCard).join("");
 }
 
 function renderCard(g){
-  const home = safe(g.home_team);
   const away = safe(g.away_team);
+  const home = safe(g.home_team);
 
-  const mlRows = (g.moneyline || []).map(row => {
+  const mlRows = (g.moneyline || []).map(row=>{
     const team = safe(row.team);
     const open = "—";
-    const live = row.live_price ?? "—";
-    const diff = "—";
-    return `<tr>
-      <td>${team}</td>
-      <td class="num">${open}</td>
-      <td class="num">${fmtNum(live)}</td>
-      <td class="num">${diff}</td>
-    </tr>`;
-  }).join("");
-
-  const spreadRows = (g.spreads || []).map(row => {
-    const team = safe(row.team);
-    const open = "—";
-    const lp = row.live_point;
-    const lprice = row.live_price;
-    const live = (lp != null && lprice != null) ? `${signed(lp)} (${fmtNum(lprice)})` : "—";
+    const live = fmt(row.live_price);
     const diff = "—";
     return `<tr>
       <td>${team}</td>
@@ -123,25 +105,34 @@ function renderCard(g){
     </tr>`;
   }).join("");
 
-  const totalRows = (g.totals || []).map(row => {
-    const team = safe(row.team); // Over / Under
-    const open = "—";
-    const lp = row.live_point;
-    const lprice = row.live_price;
-    const live = (lp != null && lprice != null) ? `${lp} (${fmtNum(lprice)})` : "—";
-    const diff = "—";
+  const spreadRows = (g.spreads || []).map(row=>{
+    const team = safe(row.team);
+    const lp = row.live_point, lprice = row.live_price;
+    const live = (lp != null && lprice != null) ? `${signed(lp)} (${fmt(lprice)})` : "—";
     return `<tr>
       <td>${team}</td>
-      <td class="num">${open}</td>
+      <td class="num">—</td>
       <td class="num">${live}</td>
-      <td class="num">${diff}</td>
+      <td class="num">—</td>
+    </tr>`;
+  }).join("");
+
+  const totalRows = (g.totals || []).map(row=>{
+    const team = safe(row.team); // Over/Under
+    const lp = row.live_point, lprice = row.live_price;
+    const live = (lp != null && lprice != null) ? `${lp} (${fmt(lprice)})` : "—";
+    return `<tr>
+      <td>${team}</td>
+      <td class="num">—</td>
+      <td class="num">${live}</td>
+      <td class="num">—</td>
     </tr>`;
   }).join("");
 
   return `
   <section class="card">
     <div class="card-header">
-      <div class="card-title">${away}  @  ${home}</div>
+      <div class="card-title">${away} @ ${home}</div>
       <div class="badge">${g.commence_time_est}</div>
     </div>
 
@@ -171,28 +162,22 @@ function renderCard(g){
   </section>`;
 }
 
-function labelizeSport(key){
+/* ===== utils ===== */
+function labelSport(key){
   const map = {
-    americanfootball_ncaaf: "NCAAF",
-    americanfootball_nfl: "NFL",
     baseball_mlb: "MLB",
-    basketball_wnba: "WNBA",
     mma_mixed_martial_arts: "MMA",
+    basketball_wnba: "WNBA",
+    americanfootball_nfl: "NFL",
+    americanfootball_ncaaf: "NCAAF",
   };
   return map[key] || key;
 }
-
-function titleCase(s){
-  return s.replace(/[_-]/g," ").replace(/\b\w/g, c => c.toUpperCase());
-}
-
-function fmtNum(v){
-  if (v === null || v === undefined || v === "") return "—";
-  return String(v);
-}
+function titleCase(s){ return (s||"").replace(/[_-]/g," ").replace(/\b\w/g, c=>c.toUpperCase()); }
+function fmt(v){ return (v === null || v === undefined || v === "") ? "—" : String(v); }
 function signed(v){
-  if (v === null || v === undefined) return "";
-  const n = Number(v);
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v); if (Number.isNaN(n)) return String(v);
   return n > 0 ? `+${n}` : String(n);
 }
 function safe(s){ return (s ?? "").toString(); }
