@@ -3,84 +3,40 @@
   --muted:#8fa0b3; --text:#e8eef6; --line:#2b3446;
   --chip:#243047; --chip-active:#314567; --accent:#7e8df5;
 }
-
 *{box-sizing:border-box}
 html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
   font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
-
-/* HEADER */
 .site-header{padding:18px 22px 10px;border-bottom:1px solid var(--line);
   background:linear-gradient(180deg,rgba(22,30,44,.7),rgba(22,30,44,.35))}
 .header-row{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .title{font-weight:700;font-size:20px;color:#9db0ff;white-space:nowrap}
-
-/* RIGHT TOOLBAR (buttons area) */
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .ctl{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
-.ctl select{
-  background:var(--panel-2);color:var(--text);border:1px solid var(--line);
-  padding:8px 10px;border-radius:10px;font-size:13px;min-width:150px
-}
-
-/* Big pill "Load Odds" button */
-.pill-btn{
-  padding:10px 16px;border-radius:999px;border:1px solid #3a4c70;
-  background:linear-gradient(180deg,#283552,#1c2740);
-  color:#e8eef6;font-weight:600;letter-spacing:.02em;cursor:pointer;
-  box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 4px 14px rgba(0,0,0,.35);
-  transition:transform .03s ease, box-shadow .15s ease, border-color .15s ease
-}
+.ctl select{background:var(--panel-2);color:var(--text);border:1px solid var(--line);
+  padding:8px 10px;border-radius:10px;font-size:13px;min-width:150px}
+.pill-btn{padding:10px 16px;border-radius:999px;border:1px solid #3a4c70;
+  background:linear-gradient(180deg,#283552,#1c2740);color:#e8eef6;font-weight:600;
+  letter-spacing:.02em;cursor:pointer;box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 4px 14px rgba(0,0,0,.35);
+  transition:transform .03s ease, box-shadow .15s ease, border-color .15s ease}
 .pill-btn:hover{border-color:#5b74b0;box-shadow:0 1px 0 rgba(255,255,255,.06) inset, 0 6px 18px rgba(0,0,0,.45)}
 .pill-btn:active{transform:translateY(1px)}
-
-/* DATE CHIPS + AS-OF LINE */
 .chips-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px}
 .chip-row{display:flex;gap:8px;flex-wrap:wrap}
-.chip{
-  background:var(--chip);color:var(--text);padding:7px 12px;border-radius:999px;
-  border:1px solid var(--line);cursor:pointer;font-size:13px
-}
+.chip{background:var(--chip);color:var(--text);padding:7px 12px;border-radius:999px;border:1px solid var(--line);cursor:pointer;font-size:13px}
 .chip.active{background:var(--chip-active);border-color:var(--accent)}
 .asof{color:var(--muted);font-size:12px}
-
-/* GRID OF CARDS */
-#cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
-  gap:16px;padding:18px 22px}
-
-/* CARDS */
-.card{
-  background:linear-gradient(180deg,rgba(18,25,38,.9),rgba(18,25,38,.85));
-  border:1px solid var(--line);border-radius:14px;overflow:hidden;
-  box-shadow:0 0 0 1px rgba(0,0,0,.18) inset, 0 10px 28px rgba(0,0,0,.35)
-}
-.card-header{
-  display:flex;justify-content:space-between;align-items:center;
-  padding:12px 14px;border-bottom:1px dashed #35425a;color:var(--muted);font-size:12px
-}
+#cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px;padding:18px 22px}
+.card{background:linear-gradient(180deg,rgba(18,25,38,.9),rgba(18,25,38,.85));border:1px solid var(--line);border-radius:14px;overflow:hidden;
+  box-shadow:0 0 0 1px rgba(0,0,0,.18) inset, 0 10px 28px rgba(0,0,0,.35)}
+.card-header{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px dashed #35425a;color:var(--muted);font-size:12px}
 .card-title{color:var(--text);font-weight:650;letter-spacing:.01em}
-
-/* SECTION HEADS like MONEYLINE / SPREAD / TOTAL */
 .section{padding:10px 14px;border-top:1px dashed #35425a}
-.section h4{
-  margin:0 0 8px 0;color:#92a5c4;font-size:11px;letter-spacing:.12em;
-  font-weight:700;opacity:.92
-}
-
-/* TABLES */
+.section h4{margin:0 0 8px 0;color:#92a5c4;font-size:11px;letter-spacing:.12em;font-weight:700;opacity:.92}
 .table{width:100%;border-collapse:collapse}
-.table th,.table td{
-  padding:8px 4px;border-bottom:1px dotted #2a3650;font-size:13px;text-align:left
-}
+.table th,.table td{padding:8px 4px;border-bottom:1px dotted #2a3650;font-size:13px;text-align:left}
 .table th{color:#95a6c2;font-weight:650}
 .table td.num{font-variant-numeric:tabular-nums}
-
-/* Small pill badges (kickoff) */
-.badge{
-  padding:3px 8px;border:1px solid #34425e;border-radius:999px;
-  color:#a7b6cf;font-size:11px;background:rgba(38,48,72,.35)
-}
-
-/* Responsive tightening on narrow screens */
+.badge{padding:3px 8px;border:1px solid #34425e;border-radius:999px;color:#a7b6cf;font-size:11px;background:rgba(38,48,72,.35)}
 @media (max-width: 720px){
   .header-row{align-items:flex-start;gap:10px}
   .toolbar{width:100%;justify-content:flex-start}
