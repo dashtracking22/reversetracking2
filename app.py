@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, Any
@@ -17,6 +18,7 @@ from flask_cors import CORS
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
+app.logger.setLevel(logging.INFO)
 
 # ===== Odds API config =====
 API_KEY = os.getenv("API_KEY")
@@ -41,43 +43,75 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
 def _redis_headers():
     return {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
 
+def _json_get(url: str, timeout: int = 8) -> dict:
+    r = requests.get(url, headers=_redis_headers(), timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
 def redis_ping() -> Tuple[Optional[str], Optional[str]]:
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return None, "Missing Upstash env vars"
     try:
-        r = requests.get(f"{UPSTASH_URL}/PING", headers=_redis_headers(), timeout=8)
-        r.raise_for_status()
-        return r.json().get("result"), None
+        return _json_get(f"{UPSTASH_URL}/PING").get("result"), None
     except Exception as e:
         return None, str(e)
 
-def redis_get(key: str) -> Tuple[Optional[str], Optional[str]]:
-    """GET with URL-encoded key."""
+# ----- Dual-read + migrate helpers -----
+def redis_get_dual(key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Try encoded GET first; if not found, try legacy raw GET.
+    Returns (value, where, err) where where ∈ {"encoded","legacy",None}.
+    """
     if not (UPSTASH_URL and UPSTASH_TOKEN):
-        return None, "Missing Upstash env vars"
+        return None, None, "Missing Upstash env vars"
     try:
-        k = quote(key, safe="")
-        r = requests.get(f"{UPSTASH_URL}/GET/{k}", headers=_redis_headers(), timeout=8)
-        r.raise_for_status()
-        return r.json().get("result"), None
+        k_enc = quote(key, safe="")
+        d1 = _json_get(f"{UPSTASH_URL}/GET/{k_enc}")
+        if d1.get("result") is not None:
+            return d1["result"], "encoded", None
+        d2 = _json_get(f"{UPSTASH_URL}/GET/{key}")
+        if d2.get("result") is not None:
+            return d2["result"], "legacy", None
+        return None, None, None
     except Exception as e:
-        return None, str(e)
+        app.logger.error("Redis GET failed key=%s err=%s", key, e)
+        return None, None, str(e)
 
-def redis_setnx(key: str, value: Any, ex_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
-    """SET key value NX with URL-encoded key & value. Returns True if created."""
+def redis_setnx_encoded(key: str, value: Any, ex_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return False, "Missing Upstash env vars"
     try:
-        k = quote(key, safe="")
-        v = quote(str(value), safe="")
+        k = quote(key, safe=""); v = quote(str(value), safe="")
         url = f"{UPSTASH_URL}/SET/{k}/{v}?NX=1"
         if ex_seconds is not None:
             url += f"&EX={int(ex_seconds)}"
-        r = requests.get(url, headers=_redis_headers(), timeout=8)
-        r.raise_for_status()
-        return r.json().get("result") == "OK", None
+        return _json_get(url).get("result") == "OK", None
     except Exception as e:
+        app.logger.error("Redis SETNX failed key=%s val=%s err=%s", key, value, e)
         return False, str(e)
+
+def redis_set_encoded(key: str, value: Any, ex_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+    if not (UPSTASH_URL and UPSTASH_TOKEN):
+        return False, "Missing Upstash env vars"
+    try:
+        k = quote(key, safe=""); v = quote(str(value), safe="")
+        url = f"{UPSTASH_URL}/SET/{k}/{v}"
+        if ex_seconds is not None:
+            url += f"?EX={int(ex_seconds)}"
+        return _json_get(url).get("result") == "OK", None
+    except Exception as e:
+        app.logger.error("Redis SET failed key=%s err=%s", key, e)
+        return False, str(e)
+
+def redis_del_both(key: str) -> None:
+    try:
+        _json_get(f"{UPSTASH_URL}/DEL/{quote(key, safe='')}")
+    except Exception:
+        pass
+    try:
+        _json_get(f"{UPSTASH_URL}/DEL/{key}")
+    except Exception:
+        pass
 
 # ===== Helpers for openings =====
 OPEN_TTL = 7 * 24 * 3600  # 7 days
@@ -100,7 +134,6 @@ def key_total_price(sport: str, event_id: str, ou_label: str) -> str:
 def _to_float(val: Any) -> Optional[float]:
     if val is None:
         return None
-    # try numeric → allow "+110" form
     for candidate in (val, str(val).replace("+", "")):
         try:
             return float(candidate)
@@ -110,19 +143,22 @@ def _to_float(val: Any) -> Optional[float]:
 
 def get_or_set_opening(key: str, current_value: Optional[Any]) -> Optional[float]:
     """
-    Returns opening value (float) for a key.
-    If none exists and current_value is provided, writes it NX and returns it.
+    Read opening (try encoded, then legacy). If legacy found, migrate -> encoded.
+    If missing and current_value is provided, write encoded NX and return it.
     """
-    existing, err = redis_get(key)
+    existing, where, err = redis_get_dual(key)
     if err is None and existing is not None:
+        if where == "legacy":
+            # migrate legacy -> encoded once
+            redis_set_encoded(key, existing, ex_seconds=OPEN_TTL)
+            redis_del_both(key)
         return _to_float(existing)
 
     if current_value is None:
         return None
 
-    # Write-if-not-exists (NX)
-    redis_setnx(key, current_value, ex_seconds=OPEN_TTL)
-    stored, _ = redis_get(key)
+    redis_setnx_encoded(key, current_value, ex_seconds=OPEN_TTL)
+    stored, _, _ = redis_get_dual(key)
     return _to_float(stored)
 
 # ===== Static root =====
@@ -238,7 +274,7 @@ def odds():
         home = ev.get("home_team")
         event_id = ev.get("id")
 
-        # ---- Moneyline opening + diff (American odds delta) ----
+        # Moneyline opening + diff (American odds delta)
         ml_rows = []
         for team in [away, home]:
             live_price = h2h.get(team)
@@ -259,7 +295,7 @@ def odds():
                 "diff_price": diff_price
             })
 
-        # ---- Spread opening + diff (points only) ----
+        # Spreads opening + diff (points only)
         sp_rows = []
         for team in [away, home]:
             row = spreads.get(team) or {}
@@ -272,44 +308,40 @@ def odds():
                 # store price too for completeness
                 kpp = key_spread_price(sport, event_id, team)
                 _ = get_or_set_opening(kpp, lprice)
-
             diff_point = None
             if open_point is not None and lp is not None:
                 try:
                     diff_point = float(lp) - float(open_point)
                 except Exception:
                     diff_point = None
-
             sp_rows.append({
                 "team": team,
                 "open_point": open_point,
-                "open_price": None,    # not used in diff now
+                "open_price": None,
                 "live_point": lp,
                 "live_price": lprice,
                 "diff_point": diff_point
             })
 
-        # ---- Totals opening + diff (points only) ----
+        # Totals opening + diff (points only)
         tot_rows = []
         for row in totals:
-            ou_lab = row.get("team")  # "Over" or "Under"
+            ou_lab = row.get("team")  # "Over" / "Under"
             lp = row.get("point")
             lprice = row.get("price")
             open_point = None
             if ou_lab:
                 ktp = key_total_point(sport, event_id, ou_lab)
                 open_point = get_or_set_opening(ktp, lp)
-                # also store price
+                # store price too
                 ktpr = key_total_price(sport, event_id, ou_lab)
                 _ = get_or_set_opening(ktpr, lprice)
-
             diff_point = None
             if open_point is not None and lp is not None:
                 try:
                     diff_point = float(lp) - float(open_point)
                 except Exception:
                     diff_point = None
-
             tot_rows.append({
                 "team": ou_lab,
                 "open_point": open_point,
@@ -338,19 +370,27 @@ def odds():
         "games": games,
     })
 
-# ===== Seed openings now (force-write NX) =====
-@app.route("/seed_openings", methods=["POST"])
+# ===== Seed openings (GET + POST so you can test in browser) =====
+@app.route("/seed_openings", methods=["GET", "POST"])
 def seed_openings():
     if not API_KEY:
         return jsonify({"error": "Missing API_KEY"}), 500
 
-    sport = request.values.get("sport", DEFAULT_SPORT)
-    bookmaker = request.values.get("bookmaker", DEFAULT_BOOKMAKER)
-    try:
-        day_offset = int(request.values.get("day_offset", "0"))
-        day_offset = max(0, min(day_offset, 30))
-    except ValueError:
-        day_offset = 0
+    if request.method == "GET":
+        sport = request.args.get("sport", DEFAULT_SPORT)
+        bookmaker = request.args.get("bookmaker", DEFAULT_BOOKMAKER)
+        try:
+            day_offset = int(request.args.get("day_offset", "0"))
+        except ValueError:
+            day_offset = 0
+    else:
+        sport = request.values.get("sport", DEFAULT_SPORT)
+        bookmaker = request.values.get("bookmaker", DEFAULT_BOOKMAKER)
+        try:
+            day_offset = int(request.values.get("day_offset", "0"))
+        except ValueError:
+            day_offset = 0
+    day_offset = max(0, min(day_offset, 30))
 
     params = {
         "apiKey": API_KEY,
@@ -425,7 +465,7 @@ def seed_openings():
         # Moneyline openings
         for team in [away, home]:
             if team and h2h.get(team) is not None:
-                created, _ = redis_setnx(key_ml(sport, event_id, team), str(h2h[team]), ex_seconds=OPEN_TTL)
+                created, _ = redis_setnx_encoded(key_ml(sport, event_id, team), str(h2h[team]), ex_seconds=OPEN_TTL)
                 if created:
                     seeded += 1
 
@@ -435,7 +475,7 @@ def seed_openings():
                 continue
             row = spreads.get(team) or {}
             if row.get("point") is not None:
-                created, _ = redis_setnx(key_spread_point(sport, event_id, team), str(row["point"]), ex_seconds=OPEN_TTL)
+                created, _ = redis_setnx_encoded(key_spread_point(sport, event_id, team), str(row["point"]), ex_seconds=OPEN_TTL)
                 if created:
                     seeded += 1
 
@@ -444,7 +484,7 @@ def seed_openings():
             ou = row.get("team")
             p = row.get("point")
             if ou and p is not None:
-                created, _ = redis_setnx(key_total_point(sport, event_id, ou), str(p), ex_seconds=OPEN_TTL)
+                created, _ = redis_setnx_encoded(key_total_point(sport, event_id, ou), str(p), ex_seconds=OPEN_TTL)
                 if created:
                     seeded += 1
 
@@ -458,8 +498,12 @@ def seed_openings():
     }), 200
 
 # ===== Debug =====
+@app.route("/debug/boot")
+def debug_boot():
+    return jsonify({"booted_at_est": datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")})
+
 @app.route("/debug/redis/ping")
-def debug_ping():
+def debug_ping_route():
     res, err = redis_ping()
     if err:
         return jsonify({"ok": False, "error": err}), 500
@@ -470,10 +514,10 @@ def debug_get():
     k = request.args.get("key")
     if not k:
         return jsonify({"error": "key is required"}), 400
-    res, err = redis_get(k)
+    val, where, err = redis_get_dual(k)
     if err:
         return jsonify({"error": err}), 500
-    return jsonify({"key": k, "result": res})
+    return jsonify({"key": k, "result": val, "where": where})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5050")), debug=True)
