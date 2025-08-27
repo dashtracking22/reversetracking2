@@ -1,7 +1,8 @@
 import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
+from urllib.parse import quote
 
 import requests
 from flask import Flask, jsonify, request, send_from_directory
@@ -51,25 +52,30 @@ def redis_ping() -> Tuple[Optional[str], Optional[str]]:
         return None, str(e)
 
 def redis_get(key: str) -> Tuple[Optional[str], Optional[str]]:
+    """GET with URL-encoded key."""
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return None, "Missing Upstash env vars"
     try:
-        r = requests.get(f"{UPSTASH_URL}/GET/{key}", headers=_redis_headers(), timeout=8)
+        k = quote(key, safe="")
+        r = requests.get(f"{UPSTASH_URL}/GET/{k}", headers=_redis_headers(), timeout=8)
         r.raise_for_status()
         return r.json().get("result"), None
     except Exception as e:
         return None, str(e)
 
-def redis_setnx(key: str, value: str, ex_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+def redis_setnx(key: str, value: Any, ex_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+    """SET key value NX with URL-encoded key & value. Returns True if created."""
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return False, "Missing Upstash env vars"
     try:
-        url = f"{UPSTASH_URL}/SET/{key}/{value}?NX=1"
+        k = quote(key, safe="")
+        v = quote(str(value), safe="")
+        url = f"{UPSTASH_URL}/SET/{k}/{v}?NX=1"
         if ex_seconds is not None:
             url += f"&EX={int(ex_seconds)}"
         r = requests.get(url, headers=_redis_headers(), timeout=8)
         r.raise_for_status()
-        return r.json().get("result") == "OK", None  # True if created, False if already existed
+        return r.json().get("result") == "OK", None
     except Exception as e:
         return False, str(e)
 
@@ -91,39 +97,33 @@ def key_total_point(sport: str, event_id: str, ou_label: str) -> str:  # 'Over' 
 def key_total_price(sport: str, event_id: str, ou_label: str) -> str:
     return f"opening:{sport}:{event_id}:total_price:{ou_label}"
 
-def get_or_set_opening(key: str, current_value: Optional[float | int | str]) -> Optional[float]:
+def _to_float(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    # try numeric → allow "+110" form
+    for candidate in (val, str(val).replace("+", "")):
+        try:
+            return float(candidate)
+        except Exception:
+            pass
+    return None
+
+def get_or_set_opening(key: str, current_value: Optional[Any]) -> Optional[float]:
     """
-    Returns opening value (float if numeric) for a key.
-    If none exists and current_value is provided, writes it with NX and returns it.
+    Returns opening value (float) for a key.
+    If none exists and current_value is provided, writes it NX and returns it.
     """
-    # Try read
     existing, err = redis_get(key)
     if err is None and existing is not None:
-        try:
-            return float(existing)
-        except Exception:
-            # If it's not numeric, return as is (but our use is numeric)
-            try:
-                return float(str(existing).replace("+",""))
-            except Exception:
-                return None
+        return _to_float(existing)
 
-    # Write-if-not-exists (NX) only if we have a current value
     if current_value is None:
         return None
-    val_str = str(current_value)
-    _, _ = redis_setnx(key, val_str, ex_seconds=OPEN_TTL)
-    # Read back (best-effort)
+
+    # Write-if-not-exists (NX)
+    redis_setnx(key, current_value, ex_seconds=OPEN_TTL)
     stored, _ = redis_get(key)
-    if stored is None:
-        return None
-    try:
-        return float(stored)
-    except Exception:
-        try:
-            return float(str(stored).replace("+",""))
-        except Exception:
-            return None
+    return _to_float(stored)
 
 # ===== Static root =====
 @app.route("/")
@@ -139,7 +139,7 @@ def sports():
 def bookmakers():
     return jsonify({"bookmakers": ALLOWED_BOOKMAKERS, "default": DEFAULT_BOOKMAKER})
 
-# ===== Odds endpoint (now populates opening + diff) =====
+# ===== Odds endpoint (populates opening + diff) =====
 @app.route("/odds")
 def odds():
     if not API_KEY:
@@ -198,25 +198,25 @@ def odds():
         mkts = bm.get("markets", [])
 
         # Extractors
-        def get_h2h(mkts):
+        def get_h2h(mkts_local):
             d = {}
-            for m in mkts:
+            for m in mkts_local:
                 if m.get("key") == "h2h":
                     for o in m.get("outcomes", []):
                         d[o.get("name")] = o.get("price")
             return d
 
-        def get_spreads(mkts):
+        def get_spreads(mkts_local):
             d = {}
-            for m in mkts:
+            for m in mkts_local:
                 if m.get("key") == "spreads":
                     for o in m.get("outcomes", []):
                         d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
             return d
 
-        def get_totals(mkts):
+        def get_totals(mkts_local):
             arr = []
-            for m in mkts:
+            for m in mkts_local:
                 if m.get("key") == "totals":
                     for o in m.get("outcomes", []):
                         arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
@@ -265,12 +265,11 @@ def odds():
             row = spreads.get(team) or {}
             lp = row.get("point")
             lprice = row.get("price")
-            open_point = open_price_sp = None
-
+            open_point = None
             if team is not None:
                 kp = key_spread_point(sport, event_id, team)
                 open_point = get_or_set_opening(kp, lp)
-                # We store price too (even if we don't diff by it) for future use:
+                # store price too for completeness
                 kpp = key_spread_price(sport, event_id, team)
                 _ = get_or_set_opening(kpp, lprice)
 
@@ -284,7 +283,7 @@ def odds():
             sp_rows.append({
                 "team": team,
                 "open_point": open_point,
-                "open_price": None,    # intentionally not used in diff
+                "open_price": None,    # not used in diff now
                 "live_point": lp,
                 "live_price": lprice,
                 "diff_point": diff_point
@@ -300,7 +299,7 @@ def odds():
             if ou_lab:
                 ktp = key_total_point(sport, event_id, ou_lab)
                 open_point = get_or_set_opening(ktp, lp)
-                # also store price for completeness
+                # also store price
                 ktpr = key_total_price(sport, event_id, ou_lab)
                 _ = get_or_set_opening(ktpr, lprice)
 
@@ -339,7 +338,126 @@ def odds():
         "games": games,
     })
 
-# ===== Minimal debug endpoints =====
+# ===== Seed openings now (force-write NX) =====
+@app.route("/seed_openings", methods=["POST"])
+def seed_openings():
+    if not API_KEY:
+        return jsonify({"error": "Missing API_KEY"}), 500
+
+    sport = request.values.get("sport", DEFAULT_SPORT)
+    bookmaker = request.values.get("bookmaker", DEFAULT_BOOKMAKER)
+    try:
+        day_offset = int(request.values.get("day_offset", "0"))
+        day_offset = max(0, min(day_offset, 30))
+    except ValueError:
+        day_offset = 0
+
+    params = {
+        "apiKey": API_KEY,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "bookmakers": bookmaker,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+
+    try:
+        r = requests.get(f"{BASE_URL}/sports/{sport}/odds", params=params, timeout=12)
+        r.raise_for_status()
+        events = r.json()
+    except requests.RequestException as e:
+        return jsonify({"error": f"Odds API error: {e}"}), 502
+
+    et = ZoneInfo("America/New_York")
+    start_day = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=day_offset)
+    end_day = start_day + timedelta(days=1)
+
+    def in_window(iso_str: str) -> bool:
+        try:
+            dt_et = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(et)
+            return start_day <= dt_et < end_day
+        except Exception:
+            return False
+
+    def get_h2h(mkts_local):
+        d = {}
+        for m in mkts_local:
+            if m.get("key") == "h2h":
+                for o in m.get("outcomes", []):
+                    d[o.get("name")] = o.get("price")
+        return d
+
+    def get_spreads(mkts_local):
+        d = {}
+        for m in mkts_local:
+            if m.get("key") == "spreads":
+                for o in m.get("outcomes", []):
+                    d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
+        return d
+
+    def get_totals(mkts_local):
+        arr = []
+        for m in mkts_local:
+            if m.get("key") == "totals":
+                for o in m.get("outcomes", []):
+                    arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
+        return arr
+
+    seeded = 0
+    scanned = 0
+
+    for ev in events:
+        if not in_window(ev.get("commence_time", "")):
+            continue
+        bm = next((b for b in ev.get("bookmakers", []) if b.get("key") == bookmaker), None)
+        if not bm:
+            continue
+        scanned += 1
+        mkts = bm.get("markets", [])
+        h2h = get_h2h(mkts)
+        spreads = get_spreads(mkts)
+        totals = get_totals(mkts)
+
+        event_id = ev.get("id")
+        away = ev.get("away_team")
+        home = ev.get("home_team")
+
+        # Moneyline openings
+        for team in [away, home]:
+            if team and h2h.get(team) is not None:
+                created, _ = redis_setnx(key_ml(sport, event_id, team), str(h2h[team]), ex_seconds=OPEN_TTL)
+                if created:
+                    seeded += 1
+
+        # Spreads (points)
+        for team in [away, home]:
+            if not team:
+                continue
+            row = spreads.get(team) or {}
+            if row.get("point") is not None:
+                created, _ = redis_setnx(key_spread_point(sport, event_id, team), str(row["point"]), ex_seconds=OPEN_TTL)
+                if created:
+                    seeded += 1
+
+        # Totals (points)
+        for row in totals:
+            ou = row.get("team")
+            p = row.get("point")
+            if ou and p is not None:
+                created, _ = redis_setnx(key_total_point(sport, event_id, ou), str(p), ex_seconds=OPEN_TTL)
+                if created:
+                    seeded += 1
+
+    return jsonify({
+        "ok": True,
+        "sport": sport,
+        "bookmaker": bookmaker,
+        "day_offset": day_offset,
+        "scanned_games": scanned,
+        "seeded_fields": seeded
+    }), 200
+
+# ===== Debug =====
 @app.route("/debug/redis/ping")
 def debug_ping():
     res, err = redis_ping()
