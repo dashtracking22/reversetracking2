@@ -2,7 +2,7 @@ import os
 import time
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pytz
 import requests
@@ -12,10 +12,6 @@ from flask_cors import CORS
 # -----------------------------
 # Flask setup + static serving
 # -----------------------------
-# Serves ./static at the root URL:
-#   /            -> static/index.html
-#   /styles.css  -> static/styles.css
-#   /app.js      -> static/app.js
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
@@ -23,7 +19,6 @@ CORS(app)
 def root():
     return app.send_static_file("index.html")
 
-# Optional: direct routes for static (Flask will already serve them due to static_url_path="")
 @app.route("/styles.css")
 def styles():
     return send_from_directory(app.static_folder, "styles.css", mimetype="text/css")
@@ -32,7 +27,6 @@ def styles():
 def app_js():
     return send_from_directory(app.static_folder, "app.js", mimetype="application/javascript")
 
-# Optional health check
 @app.get("/healthz")
 def healthz():
     return "ok", 200
@@ -40,7 +34,8 @@ def healthz():
 # -----------------------------
 # Config
 # -----------------------------
-API_KEY = os.getenv("API_KEY", "").strip()
+# Accept BOTH names so you don't get bitten by Render var naming again.
+API_KEY = (os.getenv("API_KEY") or os.getenv("ODDS_API_KEY") or "").strip()
 
 CACHE_SECONDS = 30
 _cache: Dict[str, Dict[str, Any]] = {}
@@ -62,27 +57,45 @@ DEFAULT_MARKETS = ["h2h", "spreads", "totals"]
 # -----------------------------
 # Upstash REST (Redis) setup
 # -----------------------------
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL", "") or "").rstrip("/")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "") or ""
+REDIS_DEBUG = os.getenv("REDIS_DEBUG", "") in ("1", "true", "TRUE", "yes", "YES")
+
 _http = requests.Session()
 
 def has_upstash() -> bool:
-    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+    ok = bool(UPSTASH_URL and UPSTASH_TOKEN)
+    if REDIS_DEBUG and not ok:
+        print("[REDIS] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN")
+    return ok
 
 def _redis_call(cmd: str, *args, params: Optional[dict] = None, method: str = "POST"):
-    """Tiny Upstash REST client. Returns 'result' value."""
+    """Tiny Upstash REST client. Returns 'result' field, or None on error."""
     if not has_upstash():
         return None
-    url_parts = [UPSTASH_URL, cmd] + [requests.utils.quote(str(a), safe="") for a in args]
-    url = "/".join(url_parts)
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    if method.upper() == "GET":
-        resp = _http.get(url, headers=headers, params=params, timeout=6)
-    else:
-        resp = _http.post(url, headers=headers, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("result")
+    try:
+        # Quote each path segment safely
+        url_parts = [UPSTASH_URL, cmd] + [requests.utils.quote(str(a), safe="") for a in args]
+        url = "/".join(url_parts)
+        headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        if REDIS_DEBUG:
+            print(f"[REDIS] {method} {url} params={params}")
+
+        if method.upper() == "GET":
+            resp = _http.get(url, headers=headers, params=params, timeout=10)
+        else:
+            resp = _http.post(url, headers=headers, params=params, timeout=10)
+
+        if REDIS_DEBUG:
+            print(f"[REDIS] status={resp.status_code} body={resp.text[:300]}")
+
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("result")
+    except Exception as e:
+        if REDIS_DEBUG:
+            print(f"[REDIS] ERROR: {e}")
+        return None
 
 def _opening_key(sport, book, event_id, market, side):
     # side examples: "team_slug", "over", "under"
@@ -90,26 +103,32 @@ def _opening_key(sport, book, event_id, market, side):
     return f"opening:{sport}:{book}:{event_id}:{market}:{side}"
 
 def save_opening_once(sport, book, event_id, side, market, price=None, point=None, ttl_days=60):
-    """Save opening once using SET NX; return stored opening."""
+    """Save opening once using SET NX; return stored opening as dict or None."""
     if not has_upstash():
         return None
     key = _opening_key(sport, book, event_id, market, side)
     payload = {"price": price, "point": point, "ts": int(time.time())}
     try:
         params = {"NX": "true", "EX": str(ttl_days * 24 * 3600)}
+        # Important: value must be the final path segment
         _redis_call("set", key, json.dumps(payload), params=params)
-    except Exception:
-        pass
+    except Exception as e:
+        if REDIS_DEBUG:
+            print(f"[REDIS] save_opening_once SET error: {e}")
     try:
         raw = _redis_call("get", key, method="GET")
-        return json.loads(raw) if raw else None
-    except Exception:
+        if isinstance(raw, str):
+            return json.loads(raw)
+        return raw if raw else None
+    except Exception as e:
+        if REDIS_DEBUG:
+            print(f"[REDIS] save_opening_once GET error: {e}")
         return None
 
 def compute_diff(current_price=None, current_point=None, opening=None):
     """
     Moneyline: price_diff = current_price - opening.price
-    Spread/Total: point_diff = current_point - opening.point  (point-only)
+    Spread/Total: point_diff = current_point - opening.point (point-only)
     """
     if not opening:
         return {"price_diff": None, "point_diff": None}
@@ -152,7 +171,7 @@ def slug_team(name): return name.lower().replace(" ", "_").replace(".", "").repl
 
 def fetch_odds(sport, bookmaker, markets):
     if not API_KEY:
-        raise RuntimeError("Missing API_KEY environment variable for The Odds API.")
+        raise RuntimeError("Missing API_KEY/ODDS_API_KEY for The Odds API.")
     resp = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
         params={
@@ -170,7 +189,7 @@ def fetch_odds(sport, bookmaker, markets):
     return resp.json()
 
 def pick_bookmaker_lines(bookmakers, want):
-    return next((bm for bm in bookmakers or [] if bm.get("key") == want), None)
+    return next((bm for bm in (bookmakers or []) if bm.get("key") == want), None)
 
 def extract_market_outcomes(bm_data, market_key):
     for mk in bm_data.get("markets", []):
@@ -194,9 +213,30 @@ def redis_ping():
     if not has_upstash():
         return jsonify({"ok": False, "error": "UPSTASH_REDIS_REST_URL/TOKEN not set"}), 503
     try:
-        return jsonify({"ok": True, "pong": _redis_call("ping", method="GET")})
+        pong = _redis_call("ping", method="GET")
+        return jsonify({"ok": bool(pong), "pong": pong})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# TEMP: self-test endpoint to prove writes/reads using same client and flags as openings
+@app.get("/redis-selftest")
+def redis_selftest():
+    if not has_upstash():
+        return jsonify({"ok": False, "error": "no_upstash"}), 503
+    key = "selftest:hello"
+    try:
+        # SET NX + short EX
+        _redis_call("set", key, json.dumps({"v": "world"}), params={"NX": "true", "EX": "120"})
+        got = _redis_call("get", key, method="GET")
+        return jsonify({"ok": True, "key": key, "value": got})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# TEMP: fetch any key (for debugging)
+@app.get("/redis-get/<path:key>")
+def redis_get(key):
+    val = _redis_call("get", key, method="GET")
+    return jsonify({"key": key, "value": val})
 
 @app.get("/odds/<sport>")
 def odds_for_sport(sport):
@@ -247,7 +287,7 @@ def odds_for_sport(sport):
                 diffs = compute_diff(price, None, opening)
                 item["moneyline"].append({
                     "team": name,
-                    "open_price": opening.get("price") if opening else None,
+                    "open_price": (opening or {}).get("price"),
                     "live_price": price,
                     "diff_price": diffs["price_diff"],
                 })
@@ -262,8 +302,8 @@ def odds_for_sport(sport):
                 diffs = compute_diff(price, point, opening)
                 item["spreads"].append({
                     "team": name,
-                    "open_point": opening.get("point") if opening else None,
-                    "open_price": opening.get("price") if opening else None,
+                    "open_point": (opening or {}).get("point"),
+                    "open_price": (opening or {}).get("price"),
                     "live_point": point,
                     "live_price": price,
                     "diff_point": diffs["point_diff"],  # point-only
@@ -280,8 +320,8 @@ def odds_for_sport(sport):
                 diffs = compute_diff(price, point, opening)
                 item["totals"].append({
                     "team": "Over" if side == "over" else "Under",
-                    "open_point": opening.get("point") if opening else None,
-                    "open_price": opening.get("price") if opening else None,
+                    "open_point": (opening or {}).get("point"),
+                    "open_price": (opening or {}).get("price"),
                     "live_point": point,
                     "live_price": price,
                     "diff_point": diffs["point_diff"],  # point-only
