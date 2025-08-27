@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # -----------------------------
-# Flask setup + static serving
+# Flask (serves ./static at / )
 # -----------------------------
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
@@ -34,7 +34,6 @@ def healthz():
 # -----------------------------
 # Config
 # -----------------------------
-# Accept BOTH names so you don't get bitten by Render var naming again.
 API_KEY = (os.getenv("API_KEY") or os.getenv("ODDS_API_KEY") or "").strip()
 
 CACHE_SECONDS = 30
@@ -54,12 +53,11 @@ BOOKMAKERS = ["betonlineag", "draftkings", "fanduel", "caesars", "betmgm"]
 
 DEFAULT_MARKETS = ["h2h", "spreads", "totals"]
 
-# -----------------------------
-# Upstash REST (Redis) setup
-# -----------------------------
 UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL", "") or "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "") or ""
+
 REDIS_DEBUG = os.getenv("REDIS_DEBUG", "") in ("1", "true", "TRUE", "yes", "YES")
+ODDS_DEBUG  = os.getenv("ODDS_DEBUG", "")  in ("1", "true", "TRUE", "yes", "YES")
 
 _http = requests.Session()
 
@@ -69,26 +67,23 @@ def has_upstash() -> bool:
         print("[REDIS] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN")
     return ok
 
-def _redis_call(cmd: str, *args, params: Optional[dict] = None, method: str = "POST"):
-    """Tiny Upstash REST client. Returns 'result' field, or None on error."""
+def _redis_call(cmd: str, *args, params: Optional[dict] = None, method: str = "GET"):
+    """
+    Upstash REST helper. For simple commands (SET/GET/PING), use GET with path args.
+    Returns the 'result' field or None on error.
+    """
     if not has_upstash():
         return None
     try:
-        # Quote each path segment safely
-        url_parts = [UPSTASH_URL, cmd] + [requests.utils.quote(str(a), safe="") for a in args]
+        cmd_path = cmd.upper()  # 'SET', 'GET', 'PING'
+        url_parts = [UPSTASH_URL, cmd_path] + [requests.utils.quote(str(a), safe="") for a in args]
         url = "/".join(url_parts)
         headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
         if REDIS_DEBUG:
             print(f"[REDIS] {method} {url} params={params}")
-
-        if method.upper() == "GET":
-            resp = _http.get(url, headers=headers, params=params, timeout=10)
-        else:
-            resp = _http.post(url, headers=headers, params=params, timeout=10)
-
+        resp = _http.get(url, headers=headers, params=params, timeout=10)
         if REDIS_DEBUG:
             print(f"[REDIS] status={resp.status_code} body={resp.text[:300]}")
-
         resp.raise_for_status()
         data = resp.json()
         return data.get("result")
@@ -98,25 +93,36 @@ def _redis_call(cmd: str, *args, params: Optional[dict] = None, method: str = "P
         return None
 
 def _opening_key(sport, book, event_id, market, side):
-    # side examples: "team_slug", "over", "under"
-    # market: "moneyline" | "spread" | "total"
+    # market: moneyline | spread | total
+    # side: team_slug | over | under
     return f"opening:{sport}:{book}:{event_id}:{market}:{side}"
 
 def save_opening_once(sport, book, event_id, side, market, price=None, point=None, ttl_days=60):
-    """Save opening once using SET NX; return stored opening as dict or None."""
+    """
+    Save opening once with NX; avoid locking in blanks.
+    Returns stored opening dict or None.
+    """
     if not has_upstash():
         return None
+
+    # Guard against nulls (prevents locking in bad openings)
+    if market == "moneyline" and price is None:
+        return None
+    if market in ("spread", "total") and point is None:
+        return None
+
     key = _opening_key(sport, book, event_id, market, side)
     payload = {"price": price, "point": point, "ts": int(time.time())}
+    value = json.dumps(payload, separators=(",", ":"))  # compact JSON
+
     try:
-        params = {"NX": "true", "EX": str(ttl_days * 24 * 3600)}
-        # Important: value must be the final path segment
-        _redis_call("set", key, json.dumps(payload), params=params)
+        _redis_call("SET", key, value, params={"NX": "true", "EX": str(ttl_days * 24 * 3600)})
     except Exception as e:
         if REDIS_DEBUG:
             print(f"[REDIS] save_opening_once SET error: {e}")
+
     try:
-        raw = _redis_call("get", key, method="GET")
+        raw = _redis_call("GET", key)
         if isinstance(raw, str):
             return json.loads(raw)
         return raw if raw else None
@@ -126,10 +132,6 @@ def save_opening_once(sport, book, event_id, side, market, price=None, point=Non
         return None
 
 def compute_diff(current_price=None, current_point=None, opening=None):
-    """
-    Moneyline: price_diff = current_price - opening.price
-    Spread/Total: point_diff = current_point - opening.point (point-only)
-    """
     if not opening:
         return {"price_diff": None, "point_diff": None}
     price_diff = None
@@ -147,7 +149,7 @@ def compute_diff(current_price=None, current_point=None, opening=None):
     return {"price_diff": price_diff, "point_diff": point_diff}
 
 # -----------------------------
-# Odds API helpers
+# Odds API
 # -----------------------------
 def _cache_key(*parts): return "|".join(str(p) for p in parts)
 
@@ -167,26 +169,44 @@ def iso_to_est_str(iso_str):
     except Exception:
         return iso_str
 
-def slug_team(name): return name.lower().replace(" ", "_").replace(".", "").replace("'", "")
+def slug_team(name):
+    return (name or "").lower().replace(" ", "_").replace(".", "").replace("'", "")
 
 def fetch_odds(sport, bookmaker, markets):
     if not API_KEY:
         raise RuntimeError("Missing API_KEY/ODDS_API_KEY for The Odds API.")
-    resp = requests.get(
-        f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
-        params={
-            "regions": "us",
-            "markets": ",".join(markets),
-            "bookmakers": bookmaker,
-            "oddsFormat": "american",
-            "dateFormat": "iso",
-            "apiKey": API_KEY,
-        },
-        timeout=20,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Odds API error {resp.status_code}: {resp.text}")
-    return resp.json()
+    params = {
+        "regions": "us",
+        "markets": ",".join(markets),
+        "bookmakers": bookmaker,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "apiKey": API_KEY,
+    }
+    last_err_text = None
+    for attempt, delay in [(1, 0.0), (2, 0.7), (3, 1.5)]:
+        try:
+            resp = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
+                params=params, timeout=30,
+            )
+            if ODDS_DEBUG:
+                remain = resp.headers.get("x-requests-remaining")
+                used   = resp.headers.get("x-requests-used")
+                print(f"[ODDS] attempt={attempt} status={resp.status_code} used={used} remaining={remain}")
+                if resp.status_code != 200:
+                    print(f"[ODDS] body: {resp.text[:500]}")
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err_text = resp.text
+                time.sleep(delay); continue
+            raise RuntimeError(f"Odds API error {resp.status_code}: {resp.text}")
+        except requests.RequestException as e:
+            last_err_text = str(e)
+            if ODDS_DEBUG: print(f"[ODDS] network error attempt={attempt}: {e}")
+            time.sleep(delay)
+    raise RuntimeError(f"Odds API request failed after retries: {last_err_text or 'unknown error'}")
 
 def pick_bookmaker_lines(bookmakers, want):
     return next((bm for bm in (bookmakers or []) if bm.get("key") == want), None)
@@ -211,31 +231,29 @@ def get_bookmakers():
 @app.get("/redis-ping")
 def redis_ping():
     if not has_upstash():
-        return jsonify({"ok": False, "error": "UPSTASH_REDIS_REST_URL/TOKEN not set"}), 503
+        return jsonify({"ok": False, "pong": None, "error": "UPSTASH_REDIS_REST_URL/TOKEN not set"}), 503
     try:
-        pong = _redis_call("ping", method="GET")
-        return jsonify({"ok": bool(pong), "pong": pong})
+        pong = _redis_call("PING")
+        return jsonify({"ok": pong == "PONG", "pong": pong})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "pong": None, "error": str(e)}), 500
 
-# TEMP: self-test endpoint to prove writes/reads using same client and flags as openings
+# Debug helpers (safe to keep; remove later if you want)
 @app.get("/redis-selftest")
 def redis_selftest():
     if not has_upstash():
         return jsonify({"ok": False, "error": "no_upstash"}), 503
     key = "selftest:hello"
     try:
-        # SET NX + short EX
-        _redis_call("set", key, json.dumps({"v": "world"}), params={"NX": "true", "EX": "120"})
-        got = _redis_call("get", key, method="GET")
+        _redis_call("SET", key, json.dumps({"v":"world"}, separators=(",", ":")), params={"NX": "true", "EX": "120"})
+        got = _redis_call("GET", key)
         return jsonify({"ok": True, "key": key, "value": got})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# TEMP: fetch any key (for debugging)
 @app.get("/redis-get/<path:key>")
 def redis_get(key):
-    val = _redis_call("get", key, method="GET")
+    val = _redis_call("GET", key)
     return jsonify({"key": key, "value": val})
 
 @app.get("/odds/<sport>")
@@ -246,12 +264,14 @@ def odds_for_sport(sport):
     if sport not in {s["key"] for s in SPORTS}:
         return jsonify({"error": f"Unsupported sport '{sport}'"}), 400
 
+    refresh = request.args.get("refresh") in ("1","true","TRUE","yes","YES")
     markets = ["h2h", "totals"] if sport == "mma_mixed_martial_arts" else DEFAULT_MARKETS
 
     ck = _cache_key("odds", sport, bookmaker, ",".join(markets))
-    cached = get_cached(ck)
-    if cached:
-        return jsonify(cached)
+    if not refresh:
+        cached = get_cached(ck)
+        if cached:
+            return jsonify(cached)
 
     try:
         games = fetch_odds(sport, bookmaker, markets)
@@ -270,6 +290,7 @@ def odds_for_sport(sport):
             "sport": sport,
             "bookmaker": bookmaker,
             "commence_time_est": iso_to_est_str(game.get("commence_time")),
+            "commence_time_iso": game.get("commence_time"),  # <-- for front-end day filter
             "home_team": game.get("home_team"),
             "away_team": game.get("away_team"),
             "moneyline": [],
@@ -306,7 +327,7 @@ def odds_for_sport(sport):
                     "open_price": (opening or {}).get("price"),
                     "live_point": point,
                     "live_price": price,
-                    "diff_point": diffs["point_diff"],  # point-only
+                    "diff_point": diffs["point_diff"],
                 })
 
         # TOTALS
@@ -324,7 +345,7 @@ def odds_for_sport(sport):
                     "open_price": (opening or {}).get("price"),
                     "live_point": point,
                     "live_price": price,
-                    "diff_point": diffs["point_diff"],  # point-only
+                    "diff_point": diffs["point_diff"],
                 })
 
         results.append(item)
@@ -339,7 +360,7 @@ def odds_for_sport(sport):
     return jsonify(payload)
 
 # -----------------------------
-# Entrypoint for local dev
+# Entrypoint
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))

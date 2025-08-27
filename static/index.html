@@ -1,58 +1,62 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Reverse — The Odds Tracking App</title>
+  <meta charset="utf-8" />
+  <title>betkarma — Cash Bros LLC</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="/styles.css" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <header class="site-header">
-    <div class="brand">Reverse — The Odds Tracking App</div>
-    <div class="toolbar">
-      <label class="field">
-        <span>Sport</span>
-        <select id="sportSelect"><option>Loading…</option></select>
+    <h1>Cash Bros LLC — betkarma</h1>
+    <div class="controls">
+      <label>
+        Sport
+        <select id="sportSelect" aria-label="Select sport"></select>
       </label>
-
-      <label class="field">
-        <span>Bookmaker</span>
-        <select id="bookmakerSelect">
-          <option value="betonlineag">BetOnline</option>
-          <option value="draftkings">DraftKings</option>
-          <option value="fanduel">FanDuel</option>
-          <option value="betmgm">BetMGM</option>
-          <option value="caesars">Caesars</option>
-          <option value="custom">Custom…</option>
+      <label>
+        Bookmaker
+        <select id="bookmakerSelect" aria-label="Select bookmaker"></select>
+      </label>
+      <label>
+        Day
+        <select id="daysSelect" aria-label="Select day filter">
+          <option value="all">All</option>
+          <option value="0">Today</option>
+          <option value="1">Tomorrow</option>
+          <option value="2">+2</option>
+          <option value="3">+3</option>
         </select>
       </label>
-
-      <label class="field hidden" id="customBookWrap">
-        <span>Custom Book</span>
-        <input id="customBookInput" placeholder="e.g., pointsbetus" />
-      </label>
-
-      <button id="refreshBtn" class="btn">Load Odds</button>
+      <button id="refreshBtn" title="Bypass cache and refetch (r)">Refresh</button>
+      <span id="asOf" class="asof"></span>
     </div>
   </header>
 
-  <div class="daybar">
-    <div id="dayScroller" class="day-scroller" role="tablist" aria-label="Select day"></div>
-  </div>
+  <main id="content"></main>
 
-  <div class="subbar">
-    <div id="status" class="status">Pick a sport and click Load Odds</div>
-    <div id="meta" class="meta"></div>
-  </div>
-
-  <main class="container">
-    <div id="games" class="games"></div>
-  </main>
-
-  <footer class="footer">
-    <div>Moneyline diff = price delta (¢). Spread/Total diff = point movement only.</div>
-    <div class="copyright">© 2025 Reverse — The Odds Tracking App</div>
-  </footer>
+  <template id="gameCardTpl">
+    <section class="game-card">
+      <div class="game-head">
+        <div class="matchup"></div>
+        <div class="kickoff"></div>
+      </div>
+      <div class="markets">
+        <div class="market">
+          <h3>Moneyline</h3>
+          <div class="rows"></div>
+        </div>
+        <div class="market">
+          <h3>Spread</h3>
+          <div class="rows"></div>
+        </div>
+        <div class="market">
+          <h3>Total</h3>
+          <div class="rows"></div>
+        </div>
+      </div>
+    </section>
+  </template>
 
   <script src="/app.js"></script>
 </body>

@@ -1,392 +1,250 @@
-/* ============================================================================
-   betkarma — Frontend Controller (pro-grade)
-   - Robust state mgmt
-   - Retry + backoff for fetch
-   - URL param sync & localStorage persistence
-   - Skeleton loading, empty states, accessible controls
-   - Clean renderers for ML / Spread / Total with Diff coloring
-   ========================================================================== */
+// --------- DOM helpers ----------
+const $  = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
-(() => {
-  // ---------------------------
-  // DOM
-  // ---------------------------
-  const $ = (sel, root = document) => root.querySelector(sel);
-  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+// --------- Elements -------------
+const sportSelect     = $("#sportSelect");
+const bookmakerSelect = $("#bookmakerSelect");
+const daysSelect      = $("#daysSelect");
+const refreshBtn      = $("#refreshBtn");
+const content         = $("#content");
+const asOfEl          = $("#asOf");
+const gameCardTpl     = $("#gameCardTpl");
 
-  const sportSelect = $("#sportSelect");
-  const bookmakerSelect = $("#bookmakerSelect");
-  const refreshBtn = $("#refreshBtn");
-  const content = $("#content");
-  const asOfEl = $("#asOf");
-  const gameCardTpl = $("#gameCardTpl");
+// --------- State / prefs --------
+const LS = {
+  SPORT: "bk.sport",
+  BOOK: "bk.book",
+  DAYS: "bk.days"
+};
 
-  // ---------------------------
-  // Constants / Config
-  // ---------------------------
-  const LS_KEYS = {
-    SPORT: "bk.selectedSport",
-    BOOK: "bk.selectedBook",
-  };
+const DEFAULTS = {
+  sport: "baseball_mlb",
+  book: "betonlineag",
+  days: "all",
+};
 
-  const BACKOFF_MS = [0, 500, 1200]; // retry delays
-  const DEFAULT_SPORT = "baseball_mlb";
-  const DEFAULT_BOOK = "betonlineag";
-
-  // ---------------------------
-  // App State
-  // ---------------------------
-  const AppState = {
-    sports: [],
-    books: [],
-    selectedSport: null,
-    selectedBook: null,
-    lastPayload: null,
-    loading: false,
-  };
-
-  // ---------------------------
-  // Utils
-  // ---------------------------
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  async function fetchJSON(url, opts = {}, attempt = 0) {
-    try {
-      const res = await fetch(url, {
-        ...opts,
-        headers: {
-          "Accept": "application/json",
-          ...(opts.headers || {}),
-        },
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status} ${text}`);
-      }
-      return res.json();
-    } catch (err) {
-      if (attempt < BACKOFF_MS.length - 1) {
-        await sleep(BACKOFF_MS[attempt + 1]);
-        return fetchJSON(url, opts, attempt + 1);
-      }
-      throw err;
-    }
-  }
-
-  function setText(el, txt) {
-    if (!el) return;
-    el.textContent = txt == null ? "" : String(txt);
-  }
-
-  function savePrefs() {
-    try {
-      localStorage.setItem(LS_KEYS.SPORT, AppState.selectedSport || "");
-      localStorage.setItem(LS_KEYS.BOOK, AppState.selectedBook || "");
-    } catch {}
-  }
-
-  function loadPrefs() {
-    try {
-      const s = localStorage.getItem(LS_KEYS.SPORT);
-      const b = localStorage.getItem(LS_KEYS.BOOK);
-      return {
-        sport: s || null,
-        book: b || null,
-      };
-    } catch {
-      return { sport: null, book: null };
-    }
-  }
-
-  function updateURLParams() {
-    const u = new URL(window.location.href);
-    if (AppState.selectedSport) u.searchParams.set("sport", AppState.selectedSport);
-    if (AppState.selectedBook) u.searchParams.set("bookmaker", AppState.selectedBook);
-    history.replaceState(null, "", u.toString());
-  }
-
-  function readURLParams() {
-    const u = new URL(window.location.href);
+function savePrefs() {
+  try {
+    localStorage.setItem(LS.SPORT, sportSelect.value || "");
+    localStorage.setItem(LS.BOOK, bookmakerSelect.value || "");
+    localStorage.setItem(LS.DAYS, daysSelect.value || "all");
+  } catch {}
+}
+function loadPrefs() {
+  try {
     return {
-      sport: u.searchParams.get("sport"),
-      book: u.searchParams.get("bookmaker"),
+      sport: localStorage.getItem(LS.SPORT) || null,
+      book: localStorage.getItem(LS.BOOK) || null,
+      days: localStorage.getItem(LS.DAYS) || null,
     };
-  }
+  } catch { return { sport: null, book: null, days: null }; }
+}
 
-  function fmtSign(num) {
-    if (num === null || num === undefined || Number.isNaN(num)) return "-";
-    if (typeof num !== "number") num = Number(num);
-    if (Number.isNaN(num)) return "-";
-    return num > 0 ? `+${num}` : `${num}`;
+// --------- Fetch util -----------
+async function fetchJSON(url) {
+  const res = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${t}`);
   }
+  return res.json();
+}
 
-  function clsDiff(val) {
-    if (typeof val !== "number" || Number.isNaN(val)) return "";
-    if (val > 0) return "diff-pos";
-    if (val < 0) return "diff-neg";
-    return "";
-  }
-
-  function safeJoinPointAndPrice(point, price) {
-    // For Spread/Total: show "point (price)" where price may be undefined
-    const hasPoint = point !== null && point !== undefined;
-    const hasPrice = price !== null && price !== undefined && `${price}` !== "";
-    if (!hasPoint && !hasPrice) return "-";
-    return hasPrice ? `${point ?? "-"} (${price})` : `${point ?? "-"}`;
-  }
-
-  function skeletonCards(count = 6) {
-    const frag = document.createDocumentFragment();
-    for (let i = 0; i < count; i++) {
-      const section = document.createElement("section");
-      section.className = "game-card skeleton";
-      section.innerHTML = `
-        <div class="game-head">
-          <div class="matchup sk-bar"></div>
-          <div class="kickoff sk-pill"></div>
-        </div>
-        <div class="markets">
-          <div class="market">
-            <h3>Moneyline</h3>
-            <div class="rows">
-              <div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div>
-              <div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div>
-            </div>
+// --------- Skeleton UI ----------
+function skeletonCards(n = 4) {
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < n; i++) {
+    const sec = document.createElement("section");
+    sec.className = "game-card skeleton";
+    sec.innerHTML = `
+      <div class="game-head">
+        <div class="matchup sk-bar"></div>
+        <div class="kickoff sk-pill"></div>
+      </div>
+      <div class="markets">
+        <div class="market">
+          <h3>Moneyline</h3>
+          <div class="rows">
+            <div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div>
+            <div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div>
           </div>
-          <div class="market"><h3>Spread</h3><div class="rows"><div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div></div></div>
-          <div class="market"><h3>Total</h3><div class="rows"><div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div></div></div>
         </div>
-      `;
-      frag.appendChild(section);
-    }
-    return frag;
+        <div class="market"><h3>Spread</h3><div class="rows"><div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div></div></div>
+        <div class="market"><h3>Total</h3><div class="rows"><div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div></div></div>
+      </div>`;
+    frag.appendChild(sec);
   }
-
-  function showSkeleton() {
-    AppState.loading = true;
+  return frag;
+}
+function setLoading(on) {
+  if (on) {
     content.innerHTML = "";
     content.appendChild(skeletonCards(4));
-    setText(asOfEl, "Loading…");
-    refreshBtn.disabled = true;
-    sportSelect.disabled = true;
-    bookmakerSelect.disabled = true;
+    asOfEl.textContent = "Loading…";
+    refreshBtn.disabled = sportSelect.disabled = bookmakerSelect.disabled = daysSelect.disabled = true;
+  } else {
+    refreshBtn.disabled = sportSelect.disabled = bookmakerSelect.disabled = daysSelect.disabled = false;
+  }
+}
+
+// --------- Render helpers -------
+function esc(s) { return (s ?? "").toString()
+  .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+  .replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
+
+function sign(v) {
+  if (v === null || v === undefined) return "-";
+  const n = Number(v); if (Number.isNaN(n)) return "-";
+  return n > 0 ? `+${n}` : `${n}`;
+}
+function diffCls(v){
+  if (typeof v !== "number" || Number.isNaN(v)) return "";
+  return v > 0 ? "diff-pos" : v < 0 ? "diff-neg" : "";
+}
+function joinPointPrice(point, price) {
+  const hasPoint = point !== null && point !== undefined;
+  const hasPrice = price !== null && price !== undefined && `${price}` !== "";
+  if (!hasPoint && !hasPrice) return "-";
+  return hasPrice ? `${point ?? "-"} (${price})` : `${point ?? "-"}`;
+}
+
+// --------- Days filter ----------
+function dayOffsetFromNow(isoStr) {
+  if (!isoStr) return null;
+  try {
+    const d = new Date(isoStr);            // ISO → Date (UTC)
+    const now = new Date();                // local
+    // Normalize both to local midnight
+    const localD = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const localNow = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const diffMs = localD - localNow;
+    return Math.round(diffMs / 86400000);
+  } catch { return null; }
+}
+
+function filterByDays(games, mode) {
+  if (mode === "all") return games;
+  const want = Number(mode);
+  return games.filter(g => {
+    const off = dayOffsetFromNow(g.commence_time_iso);
+    return off === want;
+  });
+}
+
+// --------- Rendering ------------
+function renderGames(payload) {
+  content.innerHTML = "";
+  asOfEl.textContent = `As of ${payload.as_of_est} — ${String(payload.bookmaker || "").toUpperCase()}`;
+
+  let games = payload.games || [];
+  games = filterByDays(games, daysSelect.value || "all");
+
+  if (!games.length) {
+    content.innerHTML = `<div class="error">No games for this selection.</div>`;
+    return;
   }
 
-  function clearSkeleton() {
-    AppState.loading = false;
-    refreshBtn.disabled = false;
-    sportSelect.disabled = false;
-    bookmakerSelect.disabled = false;
-  }
+  const frag = document.createDocumentFragment();
+  for (const g of games) {
+    const node = gameCardTpl.content.cloneNode(true);
+    $(".matchup", node).textContent = `${g.away_team} @ ${g.home_team}`;
+    $(".kickoff", node).textContent = g.commence_time_est || "";
 
-  function showError(err) {
-    content.innerHTML = `<div class="error">Error loading odds: ${escapeHTML(String(err))}</div>`;
-  }
+    const containers = $$(".market .rows", node);
+    const ml = containers[0], sp = containers[1], tot = containers[2];
 
-  function showEmpty() {
-    content.innerHTML = `<div class="error">No games found for your selection.</div>`;
-  }
-
-  function escapeHTML(str) {
-    return str
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#39;");
-  }
-
-  // ---------------------------
-  // Renderers
-  // ---------------------------
-  function renderMoneylineRows(container, rows) {
-    rows.forEach((r) => {
-      const diffTxt = fmtSign(r.diff_price);
-      const diffClass = clsDiff(r.diff_price);
-      const html = `
-        <div class="row" role="row">
-          <div class="cell team" role="cell">${escapeHTML(r.team ?? "-")}</div>
-          <div class="cell" role="cell">Open</div><div class="cell" role="cell">${r.open_price ?? "-"}</div>
-          <div class="cell" role="cell">Live</div><div class="cell" role="cell">${r.live_price ?? "-"}</div>
-          <div class="cell" role="cell">Diff</div><div class="cell ${diffClass}" role="cell">${diffTxt}</div>
-        </div>
-      `;
-      container.insertAdjacentHTML("beforeend", html);
+    (g.moneyline || []).forEach(r => {
+      ml.insertAdjacentHTML("beforeend", `
+        <div class="row">
+          <div class="cell team">${esc(r.team)}</div>
+          <div class="cell">Open</div><div class="cell">${r.open_price ?? "-"}</div>
+          <div class="cell">Live</div><div class="cell">${r.live_price ?? "-"}</div>
+          <div class="cell">Diff</div><div class="cell ${diffCls(r.diff_price)}">${sign(r.diff_price)}</div>
+        </div>`);
     });
-  }
 
-  function renderSpreadRows(container, rows) {
-    rows.forEach((r) => {
-      const openStr = safeJoinPointAndPrice(r.open_point, r.open_price);
-      const liveStr = safeJoinPointAndPrice(r.live_point, r.live_price);
-      const diffTxt = fmtSign(r.diff_point);
-      const diffClass = clsDiff(r.diff_point);
-      const html = `
-        <div class="row" role="row">
-          <div class="cell team" role="cell">${escapeHTML(r.team ?? "-")}</div>
-          <div class="cell" role="cell">Open</div><div class="cell" role="cell">${openStr}</div>
-          <div class="cell" role="cell">Live</div><div class="cell" role="cell">${liveStr}</div>
-          <div class="cell" role="cell">Diff</div><div class="cell ${diffClass}" role="cell">${diffTxt}</div>
-        </div>
-      `;
-      container.insertAdjacentHTML("beforeend", html);
+    (g.spreads || []).forEach(r => {
+      sp.insertAdjacentHTML("beforeend", `
+        <div class="row">
+          <div class="cell team">${esc(r.team)}</div>
+          <div class="cell">Open</div><div class="cell">${joinPointPrice(r.open_point, r.open_price)}</div>
+          <div class="cell">Live</div><div class="cell">${joinPointPrice(r.live_point, r.live_price)}</div>
+          <div class="cell">Diff</div><div class="cell ${diffCls(r.diff_point)}">${sign(r.diff_point)}</div>
+        </div>`);
     });
-  }
 
-  function renderTotalRows(container, rows) {
-    rows.forEach((r) => {
-      const openStr = safeJoinPointAndPrice(r.open_point, r.open_price);
-      const liveStr = safeJoinPointAndPrice(r.live_point, r.live_price);
-      const diffTxt = fmtSign(r.diff_point);
-      const diffClass = clsDiff(r.diff_point);
-      const html = `
-        <div class="row" role="row">
-          <div class="cell team" role="cell">${escapeHTML(r.team ?? "-")}</div>
-          <div class="cell" role="cell">Open</div><div class="cell" role="cell">${openStr}</div>
-          <div class="cell" role="cell">Live</div><div class="cell" role="cell">${liveStr}</div>
-          <div class="cell" role="cell">Diff</div><div class="cell ${diffClass}" role="cell">${diffTxt}</div>
-        </div>
-      `;
-      container.insertAdjacentHTML("beforeend", html);
+    (g.totals || []).forEach(r => {
+      tot.insertAdjacentHTML("beforeend", `
+        <div class="row">
+          <div class="cell team">${esc(r.team)}</div>
+          <div class="cell">Open</div><div class="cell">${joinPointPrice(r.open_point, r.open_price)}</div>
+          <div class="cell">Live</div><div class="cell">${joinPointPrice(r.live_point, r.live_price)}</div>
+          <div class="cell">Diff</div><div class="cell ${diffCls(r.diff_point)}">${sign(r.diff_point)}</div>
+        </div>`);
     });
+
+    frag.appendChild(node);
   }
+  content.appendChild(frag);
+}
 
-  function renderGames(payload) {
-    content.innerHTML = "";
-    setText(asOfEl, `As of ${payload.as_of_est} — ${String(payload.bookmaker || "").toUpperCase()}`);
+// --------- Loaders --------------
+async function loadSports() {
+  const data = await fetchJSON("/sports");
+  const sports = data.sports || [];
+  sportSelect.innerHTML = sports.map(s => `<option value="${s.key}">${esc(s.label)}</option>`).join("");
+  const prefs = loadPrefs();
+  const pick = (prefs.sport && sports.some(s => s.key === prefs.sport) && prefs.sport) || (sports[0]?.key) || DEFAULTS.sport;
+  sportSelect.value = pick;
+}
 
-    const games = payload.games || [];
-    if (games.length === 0) {
-      showEmpty();
-      return;
-    }
+async function loadBooks() {
+  const data = await fetchJSON("/bookmakers");
+  const books = data.bookmakers || [];
+  bookmakerSelect.innerHTML = books.map(b => `<option value="${b}">${esc(b)}</option>`).join("");
+  const prefs = loadPrefs();
+  const pick = (prefs.book && books.includes(prefs.book) && prefs.book) || (books[0]) || DEFAULTS.book;
+  bookmakerSelect.value = pick;
+  daysSelect.value = loadPrefs().days || DEFAULTS.days;
+}
 
-    const frag = document.createDocumentFragment();
+async function loadOdds({ refresh = false } = {}) {
+  const sport = sportSelect.value || DEFAULTS.sport;
+  const book  = bookmakerSelect.value || DEFAULTS.book;
+  const url = `/odds/${encodeURIComponent(sport)}?bookmaker=${encodeURIComponent(book)}${refresh ? "&refresh=1" : ""}`;
 
-    for (const g of games) {
-      const node = gameCardTpl.content.cloneNode(true);
-      $(".matchup", node).textContent = `${g.away_team} @ ${g.home_team}`;
-      $(".kickoff", node).textContent = g.commence_time_est || "";
-
-      const marketContainers = $$(".market .rows", node);
-      const mlContainer = marketContainers[0];
-      const spContainer = marketContainers[1];
-      const totContainer = marketContainers[2];
-
-      renderMoneylineRows(mlContainer, g.moneyline || []);
-      renderSpreadRows(spContainer, g.spreads || []);
-      renderTotalRows(totContainer, g.totals || []);
-
-      frag.appendChild(node);
-    }
-
-    content.appendChild(frag);
+  setLoading(true);
+  try {
+    const payload = await fetchJSON(url);
+    renderGames(payload);
+  } catch (e) {
+    console.error(e);
+    content.innerHTML = `<div class="error">Error loading odds: ${String(e.message || e)}</div>`;
+  } finally {
+    setLoading(false);
   }
+}
 
-  // ---------------------------
-  // Loaders
-  // ---------------------------
-  async function loadSports() {
-    const data = await fetchJSON("/sports");
-    AppState.sports = data.sports || [];
-    sportSelect.innerHTML = AppState.sports
-      .map((s) => `<option value="${s.key}">${escapeHTML(s.label)}</option>`)
-      .join("");
+// --------- Events ---------------
+refreshBtn.addEventListener("click", () => { savePrefs(); loadOdds({ refresh: true }); });
+sportSelect.addEventListener("change", () => { savePrefs(); loadOdds({ refresh: true }); });
+bookmakerSelect.addEventListener("change", () => { savePrefs(); loadOdds({ refresh: true }); });
+daysSelect.addEventListener("change", () => { savePrefs(); loadOdds({ refresh: false }); });
 
-    // pick from URL param > localStorage > default
-    const { sport: qsSport } = readURLParams();
-    const { sport: lsSport } = loadPrefs();
-    const pick =
-      (qsSport && AppState.sports.some((s) => s.key === qsSport) && qsSport) ||
-      (lsSport && AppState.sports.some((s) => s.key === lsSport) && lsSport) ||
-      (AppState.sports[0] && AppState.sports[0].key) ||
-      DEFAULT_SPORT;
-
-    AppState.selectedSport = pick;
-    sportSelect.value = pick;
+document.addEventListener("keydown", (e) => {
+  if (e.key.toLowerCase() === "r" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault(); refreshBtn.click();
   }
+});
 
-  async function loadBookmakers() {
-    const data = await fetchJSON("/bookmakers");
-    AppState.books = data.bookmakers || [];
-    bookmakerSelect.innerHTML = AppState.books
-      .map((b) => `<option value="${b}">${escapeHTML(b)}</option>`)
-      .join("");
-
-    const { book: qsBook } = readURLParams();
-    const { book: lsBook } = loadPrefs();
-    const pick =
-      (qsBook && AppState.books.includes(qsBook) && qsBook) ||
-      (lsBook && AppState.books.includes(lsBook) && lsBook) ||
-      (AppState.books[0] || DEFAULT_BOOK);
-
-    AppState.selectedBook = pick;
-    bookmakerSelect.value = pick;
+// --------- Init -----------------
+(async function init(){
+  try {
+    await Promise.all([loadSports(), loadBooks()]);
+    await loadOdds({ refresh: true });
+  } catch (e) {
+    console.error(e);
+    content.innerHTML = `<div class="error">Startup failed: ${String(e.message || e)}</div>`;
   }
-
-  async function loadOdds({ refresh = false } = {}) {
-    const sport = AppState.selectedSport || DEFAULT_SPORT;
-    const bk = AppState.selectedBook || DEFAULT_BOOK;
-
-    showSkeleton();
-    try {
-      const url = `/odds/${encodeURIComponent(sport)}?bookmaker=${encodeURIComponent(bk)}${
-        refresh ? "&refresh=1" : ""
-      }`;
-      const payload = await fetchJSON(url);
-      AppState.lastPayload = payload;
-      renderGames(payload);
-    } catch (err) {
-      showError(err);
-      console.error("[Odds] load error:", err);
-    } finally {
-      clearSkeleton();
-    }
-  }
-
-  // ---------------------------
-  // Events
-  // ---------------------------
-  refreshBtn.addEventListener("click", () => {
-    loadOdds({ refresh: true });
-  });
-
-  sportSelect.addEventListener("change", () => {
-    AppState.selectedSport = sportSelect.value;
-    savePrefs();
-    updateURLParams();
-    loadOdds({ refresh: true });
-  });
-
-  bookmakerSelect.addEventListener("change", () => {
-    AppState.selectedBook = bookmakerSelect.value;
-    savePrefs();
-    updateURLParams();
-    loadOdds({ refresh: true });
-  });
-
-  // Keyboard shortcut: r to refresh
-  document.addEventListener("keydown", (e) => {
-    if (e.key.toLowerCase() === "r" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      e.preventDefault();
-      refreshBtn.click();
-    }
-  });
-
-  // ---------------------------
-  // Init
-  // ---------------------------
-  (async function init() {
-    try {
-      // load meta first
-      await Promise.all([loadSports(), loadBookmakers()]);
-      // ensure URL matches state
-      updateURLParams();
-      // initial fetch
-      await loadOdds({ refresh: true });
-    } catch (err) {
-      showError(err);
-      console.error("[Init] error:", err);
-    }
-  })();
 })();
