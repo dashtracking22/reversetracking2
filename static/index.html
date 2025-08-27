@@ -8,20 +8,30 @@
 </head>
 <body>
   <header class="site-header">
-    <div class="title">Reverse — The Odds Tracking App</div>
-    <div class="controls">
-      <div class="chip-row" id="dateChips"></div>
-      <div class="selectors">
-        <label>Sport
+    <div class="header-row">
+      <div class="title">Reverse — The Odds Tracking App</div>
+
+      <!-- RIGHT TOOLBAR (like your screenshot) -->
+      <div class="toolbar">
+        <label class="ctl">
+          <span>Sport</span>
           <select id="sportSelect"></select>
         </label>
-        <label>Bookmaker
+
+        <label class="ctl">
+          <span>Bookmaker</span>
           <select id="bookmakerSelect"></select>
         </label>
-        <button id="loadBtn">Load Odds</button>
+
+        <button id="loadBtn" class="pill-btn">Load Odds</button>
       </div>
     </div>
-    <div class="asof" id="asOfText"></div>
+
+    <!-- DATE CHIPS ROW -->
+    <div class="chips-row">
+      <div class="chip-row" id="dateChips"></div>
+      <div class="asof" id="asOfText"></div>
+    </div>
   </header>
 
   <main id="cards"></main>
