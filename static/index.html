@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>Reverse — The Odds Tracking App</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link href="./styles.css" rel="stylesheet" />
+  <link href="/styles.css" rel="stylesheet" />
 </head>
 <body>
   <header class="site-header">
@@ -14,6 +14,7 @@
         <span>Sport</span>
         <select id="sportSelect"><option>Loading…</option></select>
       </label>
+
       <label class="field">
         <span>Bookmaker</span>
         <select id="bookmakerSelect">
@@ -25,16 +26,18 @@
           <option value="custom">Custom…</option>
         </select>
       </label>
+
       <label class="field hidden" id="customBookWrap">
         <span>Custom Book</span>
         <input id="customBookInput" placeholder="e.g., pointsbetus" />
       </label>
+
       <button id="refreshBtn" class="btn">Load Odds</button>
     </div>
   </header>
 
   <div class="daybar">
-    <div id="dayScroller" class="day-scroller"></div>
+    <div id="dayScroller" class="day-scroller" role="tablist" aria-label="Select day"></div>
   </div>
 
   <div class="subbar">
@@ -51,6 +54,6 @@
     <div class="copyright">© 2025 Reverse — The Odds Tracking App</div>
   </footer>
 
-  <script src="./app.js"></script>
+  <script src="/app.js"></script>
 </body>
 </html>

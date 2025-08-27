@@ -6,15 +6,40 @@ from typing import Any, Dict, List, Optional
 
 import pytz
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-# =========================
-# Flask setup
-# =========================
-app = Flask(__name__)
+# -----------------------------
+# Flask setup + static serving
+# -----------------------------
+# Serves ./static at the root URL:
+#   /            -> static/index.html
+#   /styles.css  -> static/styles.css
+#   /app.js      -> static/app.js
+app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
+@app.route("/")
+def root():
+    return app.send_static_file("index.html")
+
+# Optional: direct routes for static (Flask will already serve them due to static_url_path="")
+@app.route("/styles.css")
+def styles():
+    return send_from_directory(app.static_folder, "styles.css", mimetype="text/css")
+
+@app.route("/app.js")
+def app_js():
+    return send_from_directory(app.static_folder, "app.js", mimetype="application/javascript")
+
+# Optional health check
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+# -----------------------------
+# Config
+# -----------------------------
 API_KEY = os.getenv("API_KEY", "").strip()
 
 CACHE_SECONDS = 30
@@ -34,9 +59,9 @@ BOOKMAKERS = ["betonlineag", "draftkings", "fanduel", "caesars", "betmgm"]
 
 DEFAULT_MARKETS = ["h2h", "spreads", "totals"]
 
-# =========================
+# -----------------------------
 # Upstash REST (Redis) setup
-# =========================
+# -----------------------------
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 _http = requests.Session()
@@ -45,21 +70,27 @@ def has_upstash() -> bool:
     return bool(UPSTASH_URL and UPSTASH_TOKEN)
 
 def _redis_call(cmd: str, *args, params: Optional[dict] = None, method: str = "POST"):
+    """Tiny Upstash REST client. Returns 'result' value."""
     if not has_upstash():
         return None
     url_parts = [UPSTASH_URL, cmd] + [requests.utils.quote(str(a), safe="") for a in args]
     url = "/".join(url_parts)
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    resp = (_http.get if method.upper() == "GET" else _http.post)(
-        url, headers=headers, params=params, timeout=10
-    )
+    if method.upper() == "GET":
+        resp = _http.get(url, headers=headers, params=params, timeout=6)
+    else:
+        resp = _http.post(url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
-    return resp.json().get("result")
+    data = resp.json()
+    return data.get("result")
 
 def _opening_key(sport, book, event_id, market, side):
+    # side examples: "team_slug", "over", "under"
+    # market: "moneyline" | "spread" | "total"
     return f"opening:{sport}:{book}:{event_id}:{market}:{side}"
 
 def save_opening_once(sport, book, event_id, side, market, price=None, point=None, ttl_days=60):
+    """Save opening once using SET NX; return stored opening."""
     if not has_upstash():
         return None
     key = _opening_key(sport, book, event_id, market, side)
@@ -76,6 +107,10 @@ def save_opening_once(sport, book, event_id, side, market, price=None, point=Non
         return None
 
 def compute_diff(current_price=None, current_point=None, opening=None):
+    """
+    Moneyline: price_diff = current_price - opening.price
+    Spread/Total: point_diff = current_point - opening.point  (point-only)
+    """
     if not opening:
         return {"price_diff": None, "point_diff": None}
     price_diff = None
@@ -92,9 +127,9 @@ def compute_diff(current_price=None, current_point=None, opening=None):
         pass
     return {"price_diff": price_diff, "point_diff": point_diff}
 
-# =========================
+# -----------------------------
 # Odds API helpers
-# =========================
+# -----------------------------
 def _cache_key(*parts): return "|".join(str(p) for p in parts)
 
 def get_cached(key):
@@ -117,13 +152,16 @@ def slug_team(name): return name.lower().replace(" ", "_").replace(".", "").repl
 
 def fetch_odds(sport, bookmaker, markets):
     if not API_KEY:
-        raise RuntimeError("Missing API_KEY")
+        raise RuntimeError("Missing API_KEY environment variable for The Odds API.")
     resp = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
         params={
-            "regions": "us", "markets": ",".join(markets),
-            "bookmakers": bookmaker, "oddsFormat": "american",
-            "dateFormat": "iso", "apiKey": API_KEY,
+            "regions": "us",
+            "markets": ",".join(markets),
+            "bookmakers": bookmaker,
+            "oddsFormat": "american",
+            "dateFormat": "iso",
+            "apiKey": API_KEY,
         },
         timeout=20,
     )
@@ -140,17 +178,21 @@ def extract_market_outcomes(bm_data, market_key):
             return mk
     return None
 
-# =========================
-# Routes
-# =========================
+# -----------------------------
+# API routes
+# -----------------------------
 @app.get("/sports")
-def get_sports(): return jsonify({"sports": SPORTS})
+def get_sports():
+    return jsonify({"sports": SPORTS})
 
 @app.get("/bookmakers")
-def get_bookmakers(): return jsonify({"bookmakers": BOOKMAKERS})
+def get_bookmakers():
+    return jsonify({"bookmakers": BOOKMAKERS})
 
 @app.get("/redis-ping")
 def redis_ping():
+    if not has_upstash():
+        return jsonify({"ok": False, "error": "UPSTASH_REDIS_REST_URL/TOKEN not set"}), 503
     try:
         return jsonify({"ok": True, "pong": _redis_call("ping", method="GET")})
     except Exception as e:
@@ -159,73 +201,106 @@ def redis_ping():
 @app.get("/odds/<sport>")
 def odds_for_sport(sport):
     bookmaker = request.args.get("bookmaker", "betonlineag")
-    if bookmaker not in BOOKMAKERS: bookmaker = "betonlineag"
-    if sport not in {s["key"] for s in SPORTS}: return jsonify({"error": "Unsupported sport"}), 400
+    if bookmaker not in BOOKMAKERS:
+        bookmaker = "betonlineag"
+    if sport not in {s["key"] for s in SPORTS}:
+        return jsonify({"error": f"Unsupported sport '{sport}'"}), 400
+
     markets = ["h2h", "totals"] if sport == "mma_mixed_martial_arts" else DEFAULT_MARKETS
+
     ck = _cache_key("odds", sport, bookmaker, ",".join(markets))
     cached = get_cached(ck)
-    if cached: return jsonify(cached)
-    try: games = fetch_odds(sport, bookmaker, markets)
-    except Exception as e: return jsonify({"error": str(e)}), 502
+    if cached:
+        return jsonify(cached)
+
+    try:
+        games = fetch_odds(sport, bookmaker, markets)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
     results = []
     for game in games:
         event_id = game.get("id")
         bm_blob = pick_bookmaker_lines(game.get("bookmakers", []), bookmaker)
-        if not bm_blob: continue
+        if not bm_blob:
+            continue
+
         item = {
-            "event_id": event_id, "sport": sport, "bookmaker": bookmaker,
+            "event_id": event_id,
+            "sport": sport,
+            "bookmaker": bookmaker,
             "commence_time_est": iso_to_est_str(game.get("commence_time")),
-            "home_team": game.get("home_team"), "away_team": game.get("away_team"),
-            "moneyline": [], "spreads": [], "totals": [],
+            "home_team": game.get("home_team"),
+            "away_team": game.get("away_team"),
+            "moneyline": [],
+            "spreads": [],
+            "totals": [],
         }
+
         # MONEYLINE
         h2h = extract_market_outcomes(bm_blob, "h2h")
         if h2h:
-            for oc in h2h["outcomes"]:
+            for oc in h2h.get("outcomes", []):
                 name, price = oc.get("name"), oc.get("price")
                 side = slug_team(name or "")
                 opening = save_opening_once(sport, bookmaker, event_id, side, "moneyline", price, None)
                 diffs = compute_diff(price, None, opening)
                 item["moneyline"].append({
-                    "team": name, "open_price": opening.get("price") if opening else None,
-                    "live_price": price, "diff_price": diffs["price_diff"]
+                    "team": name,
+                    "open_price": opening.get("price") if opening else None,
+                    "live_price": price,
+                    "diff_price": diffs["price_diff"],
                 })
+
         # SPREADS
         spreads = extract_market_outcomes(bm_blob, "spreads")
         if spreads:
-            for oc in spreads["outcomes"]:
+            for oc in spreads.get("outcomes", []):
                 name, price, point = oc.get("name"), oc.get("price"), oc.get("point")
                 side = slug_team(name or "")
                 opening = save_opening_once(sport, bookmaker, event_id, side, "spread", price, point)
                 diffs = compute_diff(price, point, opening)
                 item["spreads"].append({
-                    "team": name, "open_point": opening.get("point") if opening else None,
+                    "team": name,
+                    "open_point": opening.get("point") if opening else None,
                     "open_price": opening.get("price") if opening else None,
-                    "live_point": point, "live_price": price,
-                    "diff_point": diffs["point_diff"]
+                    "live_point": point,
+                    "live_price": price,
+                    "diff_point": diffs["point_diff"],  # point-only
                 })
+
         # TOTALS
         totals = extract_market_outcomes(bm_blob, "totals")
         if totals:
-            for oc in totals["outcomes"]:
-                name, price, point = oc.get("name","").lower(), oc.get("price"), oc.get("point")
-                side = "over" if "over" in name else "under"
+            for oc in totals.get("outcomes", []):
+                nm = (oc.get("name") or "").lower()
+                price, point = oc.get("price"), oc.get("point")
+                side = "over" if "over" in nm else "under"
                 opening = save_opening_once(sport, bookmaker, event_id, side, "total", price, point)
                 diffs = compute_diff(price, point, opening)
                 item["totals"].append({
-                    "team": "Over" if side=="over" else "Under",
+                    "team": "Over" if side == "over" else "Under",
                     "open_point": opening.get("point") if opening else None,
                     "open_price": opening.get("price") if opening else None,
-                    "live_point": point, "live_price": price,
-                    "diff_point": diffs["point_diff"]
+                    "live_point": point,
+                    "live_price": price,
+                    "diff_point": diffs["point_diff"],  # point-only
                 })
+
         results.append(item)
-    payload = {"sport": sport, "bookmaker": bookmaker,
-               "as_of_est": datetime.now(NY_TZ).strftime("%m/%d %I:%M %p"),
-               "games": results}
+
+    payload = {
+        "sport": sport,
+        "bookmaker": bookmaker,
+        "as_of_est": datetime.now(NY_TZ).strftime("%m/%d %I:%M %p"),
+        "games": results,
+    }
     set_cached(ck, payload)
     return jsonify(payload)
 
+# -----------------------------
+# Entrypoint for local dev
+# -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
     app.run(host="0.0.0.0", port=port, debug=True)
