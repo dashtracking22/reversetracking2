@@ -14,7 +14,8 @@ async function init(){
   await hydrateSports();
   await hydrateBookmakers();
   loadBtn.addEventListener("click", loadOdds);
-  await loadOdds();
+  await loadOdds();           // first call seeds openings in Redis (server does NX)
+  // Tip: click Load Odds again after a minute to notice diffs if lines moved
 }
 
 function buildDateChips(){
@@ -94,9 +95,9 @@ function renderCard(g){
 
   const mlRows = (g.moneyline || []).map(row=>{
     const team = safe(row.team);
-    const open = "—";
+    const open = fmt(row.open_price);      // uses backend open_price
     const live = fmt(row.live_price);
-    const diff = "—";
+    const diff = fmtSigned(row.diff_price); // american-odds delta (int)
     return `<tr>
       <td>${team}</td>
       <td class="num">${open}</td>
@@ -107,25 +108,41 @@ function renderCard(g){
 
   const spreadRows = (g.spreads || []).map(row=>{
     const team = safe(row.team);
+    const oPoint = row.open_point;
+    const oPrice = row.open_price; // currently not used for diff, but show if present later
+    const open = (oPoint != null)
+      ? `${signed(oPoint)}${oPrice!=null?` (${fmt(oPrice)})`:``}`
+      : "—";
+
     const lp = row.live_point, lprice = row.live_price;
     const live = (lp != null && lprice != null) ? `${signed(lp)} (${fmt(lprice)})` : "—";
+
+    const diff = (row.diff_point != null) ? signed(row.diff_point) : "—"; // points only
     return `<tr>
       <td>${team}</td>
-      <td class="num">—</td>
+      <td class="num">${open}</td>
       <td class="num">${live}</td>
-      <td class="num">—</td>
+      <td class="num">${diff}</td>
     </tr>`;
   }).join("");
 
   const totalRows = (g.totals || []).map(row=>{
     const team = safe(row.team); // Over/Under
+    const oPoint = row.open_point;
+    const oPrice = row.open_price;
+    const open = (oPoint != null)
+      ? `${oPoint}${oPrice!=null?` (${fmt(oPrice)})`:``}`
+      : "—";
+
     const lp = row.live_point, lprice = row.live_price;
     const live = (lp != null && lprice != null) ? `${lp} (${fmt(lprice)})` : "—";
+
+    const diff = (row.diff_point != null) ? signed(row.diff_point) : "—"; // points only
     return `<tr>
       <td>${team}</td>
-      <td class="num">—</td>
+      <td class="num">${open}</td>
       <td class="num">${live}</td>
-      <td class="num">—</td>
+      <td class="num">${diff}</td>
     </tr>`;
   }).join("");
 
@@ -162,12 +179,33 @@ function renderCard(g){
   </section>`;
 }
 
-/* utils */
+/* ===== utils ===== */
 function labelSport(key){
-  const map = { americanfootball_ncaaf:"NCAAF", americanfootball_nfl:"NFL", baseball_mlb:"MLB", basketball_wnba:"WNBA", mma_mixed_martial_arts:"MMA" };
+  const map = {
+    baseball_mlb: "MLB",
+    mma_mixed_martial_arts: "MMA",
+    basketball_wnba: "WNBA",
+    americanfootball_nfl: "NFL",
+    americanfootball_ncaaf: "NCAAF",
+  };
   return map[key] || key;
 }
 function titleCase(s){ return (s||"").replace(/[_-]/g," ").replace(/\b\w/g,c=>c.toUpperCase()); }
 function fmt(v){ return (v === null || v === undefined || v === "") ? "—" : String(v); }
-function signed(v){ if (v === null || v === undefined || v === "") return "—"; const n=Number(v); return Number.isNaN(n)?String(v): (n>0?`+${n}`:String(n)); }
+function fmtSigned(v){
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return n > 0 ? `+${n}` : String(n);
+}
+function signed(v){
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return n > 0 ? `+${stripTrailingZeros(n)}` : `${stripTrailingZeros(n)}`;
+}
+function stripTrailingZeros(n){
+  // keep integers neat; otherwise keep one decimal if needed
+  return (Math.round(n) === n) ? n : Number(n.toFixed(1));
+}
 function safe(s){ return (s ?? "").toString(); }
