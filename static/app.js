@@ -14,8 +14,7 @@ async function init(){
   await hydrateSports();
   await hydrateBookmakers();
   loadBtn.addEventListener("click", loadOdds);
-  await loadOdds();           // first call seeds openings in Redis (server does NX)
-  // Tip: click Load Odds again after a minute to notice diffs if lines moved
+  await loadOdds();
 }
 
 function buildDateChips(){
@@ -37,8 +36,7 @@ function buildDateChips(){
 }
 
 async function hydrateSports(){
-  const r = await fetch("/sports");
-  const data = await r.json();
+  const data = await fetchJSON("/sports");
   sportSelect.innerHTML = "";
   (data.sports || []).forEach(s=>{
     const opt = document.createElement("option");
@@ -50,8 +48,7 @@ async function hydrateSports(){
 }
 
 async function hydrateBookmakers(){
-  const r = await fetch("/bookmakers");
-  const data = await r.json();
+  const data = await fetchJSON("/bookmakers");
   bookmakerSelect.innerHTML = "";
   (data.bookmakers || []).forEach(b=>{
     const opt = document.createElement("option");
@@ -70,13 +67,28 @@ async function loadOdds(){
       bookmaker: bookmakerSelect.value,
       day_offset: String(currentDayOffset),
     });
-    const r = await fetch(`/odds?${qs.toString()}`);
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || "Failed to load odds");
+    const data = await fetchJSON(`/odds?${qs.toString()}`);
     render(data);
   }catch(err){
-    cards.innerHTML = `<div class="badge">Error: ${err.message}</div>`;
+    cards.innerHTML = `<div class="badge">Error: ${escapeHtml(err.message)}</div>`;
   }
+}
+
+// ---- robust fetch / parse ----
+async function fetchJSON(url, options){
+  const r = await fetch(url, options);
+  const text = await r.text();               // read raw body first
+  let json;
+  try { json = text ? JSON.parse(text) : null; } catch { json = null; }
+
+  if (!r.ok) {
+    const snippet = text ? text.slice(0, 400) : "(empty body)";
+    const status = `${r.status} ${r.statusText}`;
+    const serverErr = (json && json.error) ? json.error : snippet;
+    throw new Error(`${status} — ${serverErr}`);
+  }
+  if (!json) throw new Error("Server returned an empty or non-JSON response.");
+  return json;
 }
 
 function render(payload){
@@ -95,9 +107,9 @@ function renderCard(g){
 
   const mlRows = (g.moneyline || []).map(row=>{
     const team = safe(row.team);
-    const open = fmt(row.open_price);      // uses backend open_price
+    const open = fmt(row.open_price);
     const live = fmt(row.live_price);
-    const diff = fmtSigned(row.diff_price); // american-odds delta (int)
+    const diff = fmtSigned(row.diff_price);
     return `<tr>
       <td>${team}</td>
       <td class="num">${open}</td>
@@ -109,15 +121,13 @@ function renderCard(g){
   const spreadRows = (g.spreads || []).map(row=>{
     const team = safe(row.team);
     const oPoint = row.open_point;
-    const oPrice = row.open_price; // currently not used for diff, but show if present later
+    const oPrice = row.open_price;
     const open = (oPoint != null)
       ? `${signed(oPoint)}${oPrice!=null?` (${fmt(oPrice)})`:``}`
       : "—";
-
     const lp = row.live_point, lprice = row.live_price;
     const live = (lp != null && lprice != null) ? `${signed(lp)} (${fmt(lprice)})` : "—";
-
-    const diff = (row.diff_point != null) ? signed(row.diff_point) : "—"; // points only
+    const diff = (row.diff_point != null) ? signed(row.diff_point) : "—";
     return `<tr>
       <td>${team}</td>
       <td class="num">${open}</td>
@@ -127,17 +137,15 @@ function renderCard(g){
   }).join("");
 
   const totalRows = (g.totals || []).map(row=>{
-    const team = safe(row.team); // Over/Under
+    const team = safe(row.team); // Over / Under
     const oPoint = row.open_point;
     const oPrice = row.open_price;
     const open = (oPoint != null)
       ? `${oPoint}${oPrice!=null?` (${fmt(oPrice)})`:``}`
       : "—";
-
     const lp = row.live_point, lprice = row.live_price;
     const live = (lp != null && lprice != null) ? `${lp} (${fmt(lprice)})` : "—";
-
-    const diff = (row.diff_point != null) ? signed(row.diff_point) : "—"; // points only
+    const diff = (row.diff_point != null) ? signed(row.diff_point) : "—";
     return `<tr>
       <td>${team}</td>
       <td class="num">${open}</td>
@@ -181,13 +189,7 @@ function renderCard(g){
 
 /* ===== utils ===== */
 function labelSport(key){
-  const map = {
-    baseball_mlb: "MLB",
-    mma_mixed_martial_arts: "MMA",
-    basketball_wnba: "WNBA",
-    americanfootball_nfl: "NFL",
-    americanfootball_ncaaf: "NCAAF",
-  };
+  const map = { baseball_mlb:"MLB", mma_mixed_martial_arts:"MMA", basketball_wnba:"WNBA", americanfootball_nfl:"NFL", americanfootball_ncaaf:"NCAAF" };
   return map[key] || key;
 }
 function titleCase(s){ return (s||"").replace(/[_-]/g," ").replace(/\b\w/g,c=>c.toUpperCase()); }
@@ -205,7 +207,7 @@ function signed(v){
   return n > 0 ? `+${stripTrailingZeros(n)}` : `${stripTrailingZeros(n)}`;
 }
 function stripTrailingZeros(n){
-  // keep integers neat; otherwise keep one decimal if needed
   return (Math.round(n) === n) ? n : Number(n.toFixed(1));
 }
 function safe(s){ return (s ?? "").toString(); }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
