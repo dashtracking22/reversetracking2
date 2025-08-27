@@ -1,311 +1,222 @@
 import os
-import time
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-import pytz
-import requests
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
+import requests
 
-# -----------------------------
-# Flask setup
-# -----------------------------
-app = Flask(__name__, static_folder="static", static_url_path="")
+app = Flask(__name__)
 CORS(app)
+
+# ====== Config ======
+API_KEY = os.getenv("API_KEY")  # Set on Render
+BASE_URL = "https://api.the-odds-api.com/v4"
+DEFAULT_SPORT = "americanfootball_ncaaf"
+DEFAULT_BOOKMAKER = "draftkings"
+
+# Allowed sports (feel free to add/remove once stable)
+ALLOWED_SPORTS = [
+    "americanfootball_ncaaf",
+    "americanfootball_nfl",
+    "baseball_mlb",
+    "basketball_wnba",
+    "mma_mixed_martial_arts",
+]
+
+# We’ll expose a conservative list of bookmakers
+ALLOWED_BOOKMAKERS = [
+    "draftkings",
+    "betonlineag",
+    "fanduel",
+    "caesars",
+]
+
+# ====== Static file routes (index.html, app.js, styles.css at project root) ======
 
 @app.route("/")
 def root():
-    return app.send_static_file("index.html")
+    return send_from_directory(".", "index.html")
 
-@app.route("/styles.css")
-def styles():
-    return send_from_directory(app.static_folder, "styles.css", mimetype="text/css")
+@app.route("/<path:filename>")
+def serve_static_file(filename):
+    # Serve app.js / styles.css / images if any
+    return send_from_directory(".", filename)
 
-@app.route("/app.js")
-def app_js():
-    return send_from_directory(app.static_folder, "app.js", mimetype="application/javascript")
+# ====== API: sports, bookmakers ======
 
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
+@app.route("/sports")
+def get_sports():
+    return jsonify({"sports": ALLOWED_SPORTS})
 
-# -----------------------------
-# Config
-# -----------------------------
-API_KEY = (os.getenv("API_KEY") or os.getenv("ODDS_API_KEY") or "").strip()
+@app.route("/bookmakers")
+def get_bookmakers():
+    # (We could fetch live list, but keeping static for stability)
+    return jsonify({"bookmakers": ALLOWED_BOOKMAKERS, "default": DEFAULT_BOOKMAKER})
 
-CACHE_SECONDS = 30
-_cache: Dict[str, Dict[str, Any]] = {}
+# ====== API: odds ======
+# Params:
+#   sport=<key> (required)
+#   bookmaker=<key> (required)
+#   day_offset=<int> (0=today, 1=tomorrow, etc.; default 0)
+@app.route("/odds")
+def get_odds():
+    api_key = API_KEY
+    if not api_key:
+        return jsonify({"error": "Missing API_KEY env var"}), 500
 
-NY_TZ = pytz.timezone("America/New_York")
+    sport = request.args.get("sport", DEFAULT_SPORT)
+    if sport not in ALLOWED_SPORTS:
+        return jsonify({"error": f"Unsupported sport: {sport}"}), 400
 
-SPORTS = [
-    {"key": "baseball_mlb", "label": "MLB"},
-    {"key": "mma_mixed_martial_arts", "label": "MMA"},
-    {"key": "basketball_wnba", "label": "WNBA"},
-    {"key": "americanfootball_nfl", "label": "NFL"},
-    {"key": "americanfootball_ncaaf", "label": "NCAAF"},
-]
-
-BOOKMAKERS = ["betonlineag", "draftkings", "fanduel", "caesars", "betmgm"]
-
-DEFAULT_MARKETS = ["h2h", "spreads", "totals"]
-
-UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL", "") or "").rstrip("/")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "") or ""
-
-REDIS_DEBUG = os.getenv("REDIS_DEBUG", "") in ("1", "true", "TRUE", "yes", "YES")
-
-_http = requests.Session()
-
-def has_upstash() -> bool:
-    return bool(UPSTASH_URL and UPSTASH_TOKEN)
-
-def _redis_call(cmd: str, *args, params: Optional[dict] = None):
-    """Upstash REST helper using path-args style (works with your curl)."""
-    if not has_upstash():
-        return None
-    cmd_path = cmd.upper()
-    url_parts = [UPSTASH_URL, cmd_path] + [requests.utils.quote(str(a), safe="") for a in args]
-    url = "/".join(url_parts)
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    try:
-        resp = _http.get(url, headers=headers, params=params, timeout=10)
-        if REDIS_DEBUG:
-            print(f"[REDIS] {cmd_path} {url} status={resp.status_code} body={resp.text[:200]}")
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("result")
-    except Exception as e:
-        if REDIS_DEBUG:
-            print(f"[REDIS] ERROR on {cmd}: {e}")
-        return None
-
-def _opening_key(sport, book, event_id, market, side):
-    return f"opening:{sport}:{book}:{event_id}:{market}:{side}"
-
-def save_opening_once(sport, book, event_id, side, market, price=None, point=None, ttl_days=60):
-    if not has_upstash():
-        return None
-    if market == "moneyline" and price is None:
-        return None
-    if market in ("spread", "total") and point is None:
-        return None
-
-    key = _opening_key(sport, book, event_id, market, side)
-    payload = {"price": price, "point": point, "ts": int(time.time())}
-    value = json.dumps(payload, separators=(",", ":"))
+    bookmaker = request.args.get("bookmaker", DEFAULT_BOOKMAKER)
+    if bookmaker not in ALLOWED_BOOKMAKERS:
+        return jsonify({"error": f"Unsupported bookmaker: {bookmaker}"}), 400
 
     try:
-        _redis_call("SET", key, value, params={"NX": "true", "EX": str(ttl_days * 24 * 3600)})
-    except Exception as e:
-        if REDIS_DEBUG:
-            print(f"[REDIS] save_opening_once SET error: {e}")
+        day_offset = int(request.args.get("day_offset", "0"))
+        if day_offset < 0:
+            day_offset = 0
+        if day_offset > 30:
+            day_offset = 30
+    except ValueError:
+        day_offset = 0
 
-    try:
-        raw = _redis_call("GET", key)
-        if isinstance(raw, str):
-            return json.loads(raw)
-        return raw if raw else None
-    except Exception as e:
-        if REDIS_DEBUG:
-            print(f"[REDIS] save_opening_once GET error: {e}")
-        return None
-
-def compute_diff(current_price=None, current_point=None, opening=None):
-    if not opening:
-        return {"price_diff": None, "point_diff": None}
-    price_diff = None
-    point_diff = None
-    try:
-        if current_price is not None and opening.get("price") is not None:
-            price_diff = float(current_price) - float(opening["price"])
-    except Exception:
-        pass
-    try:
-        if current_point is not None and opening.get("point") is not None:
-            point_diff = float(current_point) - float(opening["point"])
-    except Exception:
-        pass
-    return {"price_diff": price_diff, "point_diff": point_diff}
-
-# -----------------------------
-# Odds API helpers
-# -----------------------------
-def _cache_key(*parts): return "|".join(str(p) for p in parts)
-
-def get_cached(key):
-    entry = _cache.get(key)
-    if entry and time.time() - entry["ts"] <= CACHE_SECONDS:
-        return entry["data"]
-    _cache.pop(key, None)
-    return None
-
-def set_cached(key, data): _cache[key] = {"ts": time.time(), "data": data}
-
-def iso_to_est_str(iso_str):
-    try:
-        dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(timezone.utc)
-        return dt_utc.astimezone(NY_TZ).strftime("%m/%d %I:%M %p")
-    except Exception:
-        return iso_str
-
-def slug_team(name):
-    return (name or "").lower().replace(" ", "_").replace(".", "").replace("'", "")
-
-def fetch_odds(sport, bookmaker, markets):
-    if not API_KEY:
-        raise RuntimeError("Missing API_KEY/ODDS_API_KEY for The Odds API.")
+    # Fetch odds (american format) for selected bookmaker and markets
     params = {
+        "apiKey": api_key,
         "regions": "us",
-        "markets": ",".join(markets),
+        "markets": "h2h,spreads,totals",
         "bookmakers": bookmaker,
         "oddsFormat": "american",
         "dateFormat": "iso",
-        "apiKey": API_KEY,
     }
-    resp = requests.get(
-        f"https://api.the-odds-api.com/v4/sports/{sport}/odds",
-        params=params, timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()
 
-def pick_bookmaker_lines(bookmakers, want):
-    return next((bm for bm in (bookmakers or []) if bm.get("key") == want), None)
+    try:
+        r = requests.get(f"{BASE_URL}/sports/{sport}/odds", params=params, timeout=20)
+        r.raise_for_status()
+        events = r.json()
+    except requests.RequestException as e:
+        return jsonify({"error": f"Error loading odds: {e}"}), 500
 
-def extract_market_outcomes(bm_data, market_key):
-    for mk in bm_data.get("markets", []):
-        if mk.get("key") == market_key:
-            return mk
-    return None
+    # Filter by the selected calendar day in ET
+    et = ZoneInfo("America/New_York")
+    today_et = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0)
+    target_start = today_et + timedelta(days=day_offset)
+    target_end = target_start + timedelta(days=1)
 
-# -----------------------------
-# API routes
-# -----------------------------
-@app.get("/sports")
-def get_sports():
-    return jsonify({"sports": SPORTS})
+    def is_in_target_window(iso_str: str) -> bool:
+        # commence_time is ISO in UTC per Odds API, e.g., "2025-08-28T23:00:00Z"
+        try:
+            dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            dt_et = dt_utc.astimezone(et)
+            return target_start <= dt_et < target_end
+        except Exception:
+            return False
 
-@app.get("/bookmakers")
-def get_bookmakers():
-    return jsonify({"bookmakers": BOOKMAKERS})
-
-@app.get("/redis-ping")
-def redis_ping():
-    pong = _redis_call("PING")
-    return jsonify({"ok": pong == "PONG", "pong": pong})
-
-@app.get("/redis-selftest")
-def redis_selftest():
-    key = "selftest:hello"
-    _redis_call("SET", key, json.dumps({"v": "world"}), params={"EX": "60"})
-    got = _redis_call("GET", key)
-    return jsonify({"ok": True, "key": key, "value": got})
-
-@app.get("/odds/<sport>")
-def odds_for_sport(sport):
-    bookmaker = request.args.get("bookmaker", "betonlineag")
-    if bookmaker not in BOOKMAKERS:
-        bookmaker = "betonlineag"
-    if sport not in {s["key"] for s in SPORTS}:
-        return jsonify({"error": f"Unsupported sport '{sport}'"}), 400
-
-    refresh = request.args.get("refresh") in ("1","true","TRUE","yes","YES")
-    markets = ["h2h", "totals"] if sport == "mma_mixed_martial_arts" else DEFAULT_MARKETS
-
-    ck = _cache_key("odds", sport, bookmaker, ",".join(markets))
-    if not refresh:
-        cached = get_cached(ck)
-        if cached:
-            return jsonify(cached)
-
-    games = fetch_odds(sport, bookmaker, markets)
-    results = []
-    for game in games:
-        event_id = game.get("id")
-        bm_blob = pick_bookmaker_lines(game.get("bookmakers", []), bookmaker)
-        if not bm_blob:
+    # Parse per event
+    parsed = []
+    for ev in events:
+        if not is_in_target_window(ev.get("commence_time", "")):
             continue
 
-        item = {
-            "event_id": event_id,
+        bookmakers = ev.get("bookmakers", [])
+        if not bookmakers:
+            continue
+
+        # find the selected bookmaker block
+        bm_block = next((b for b in bookmakers if b.get("key") == bookmaker), None)
+        if not bm_block:
+            continue
+
+        markets = bm_block.get("markets", [])
+
+        # helper extractors
+        def extract_h2h(mkts):
+            # returns dict {team: price}
+            result = {}
+            for m in mkts:
+                if m.get("key") == "h2h":
+                    for o in m.get("outcomes", []):
+                        team = o.get("name")
+                        price = o.get("price")
+                        if team is not None:
+                            result[team] = price
+            return result
+
+        def extract_spreads(mkts):
+            # returns dict {team: {"point": float, "price": int}}
+            result = {}
+            for m in mkts:
+                if m.get("key") == "spreads":
+                    for o in m.get("outcomes", []):
+                        team = o.get("name")
+                        point = o.get("point")
+                        price = o.get("price")
+                        if team is not None:
+                            result[team] = {"point": point, "price": price}
+            return result
+
+        def extract_totals(mkts):
+            # returns list like [{"team":"Over","point":x,"price":y},{"team":"Under",...}]
+            result = []
+            for m in mkts:
+                if m.get("key") == "totals":
+                    for o in m.get("outcomes", []):
+                        result.append({
+                            "team": o.get("name"),
+                            "point": o.get("point"),
+                            "price": o.get("price"),
+                        })
+            # Normalize to Over/Under ordering if both exist
+            if len(result) == 2:
+                result.sort(key=lambda x: 0 if x["team"].lower().startswith("over") else 1)
+            return result
+
+        h2h = extract_h2h(markets)
+        spreads = extract_spreads(markets)
+        totals = extract_totals(markets)
+
+        # Commence time (ET, pretty)
+        try:
+            dt_utc = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).astimezone(et)
+            kickoff_est = dt_utc.strftime("%m/%d %I:%M %p")
+        except Exception:
+            kickoff_est = ""
+
+        parsed.append({
+            "event_id": ev.get("id"),
             "sport": sport,
+            "home_team": ev.get("home_team"),
+            "away_team": ev.get("away_team"),
+            "commence_time_est": kickoff_est,
             "bookmaker": bookmaker,
-            "commence_time_est": iso_to_est_str(game.get("commence_time")),
-            "home_team": game.get("home_team"),
-            "away_team": game.get("away_team"),
-            "moneyline": [],
-            "spreads": [],
-            "totals": [],
-        }
+            "moneyline": [{"team": t, "live_price": h2h.get(t, None), "open_price": None, "diff_price": None}
+                          for t in [ev.get("away_team"), ev.get("home_team")] if t],
+            "spreads": [{"team": t,
+                         "live_point": spreads.get(t, {}).get("point"),
+                         "live_price": spreads.get(t, {}).get("price"),
+                         "open_point": None, "open_price": None,
+                         "diff_point": None}
+                        for t in [ev.get("away_team"), ev.get("home_team")] if t],
+            "totals": [{"team": row.get("team"),
+                        "live_point": row.get("point"),
+                        "live_price": row.get("price"),
+                        "open_point": None, "open_price": None,
+                        "diff_point": None}
+                       for row in totals]
+        })
 
-        # MONEYLINE
-        h2h = extract_market_outcomes(bm_blob, "h2h")
-        if h2h:
-            for oc in h2h.get("outcomes", []):
-                name, price = oc.get("name"), oc.get("price")
-                side = slug_team(name or "")
-                opening = save_opening_once(sport, bookmaker, event_id, side, "moneyline", price, None)
-                diffs = compute_diff(price, None, opening)
-                item["moneyline"].append({
-                    "team": name,
-                    "open_price": (opening or {}).get("price"),
-                    "live_price": price,
-                    "diff_price": diffs["price_diff"],
-                })
-
-        # SPREADS
-        spreads = extract_market_outcomes(bm_blob, "spreads")
-        if spreads:
-            for oc in spreads.get("outcomes", []):
-                name, price, point = oc.get("name"), oc.get("price"), oc.get("point")
-                side = slug_team(name or "")
-                opening = save_opening_once(sport, bookmaker, event_id, side, "spread", price, point)
-                diffs = compute_diff(price, point, opening)
-                item["spreads"].append({
-                    "team": name,
-                    "open_point": (opening or {}).get("point"),
-                    "open_price": (opening or {}).get("price"),
-                    "live_point": point,
-                    "live_price": price,
-                    "diff_point": diffs["point_diff"],
-                })
-
-        # TOTALS
-        totals = extract_market_outcomes(bm_blob, "totals")
-        if totals:
-            for oc in totals.get("outcomes", []):
-                nm = (oc.get("name") or "").lower()
-                price, point = oc.get("price"), oc.get("point")
-                side = "over" if "over" in nm else "under"
-                opening = save_opening_once(sport, bookmaker, event_id, side, "total", price, point)
-                diffs = compute_diff(price, point, opening)
-                item["totals"].append({
-                    "team": "Over" if side == "over" else "Under",
-                    "open_point": (opening or {}).get("point"),
-                    "open_price": (opening or {}).get("price"),
-                    "live_point": point,
-                    "live_price": price,
-                    "diff_point": diffs["point_diff"],
-                })
-
-        results.append(item)
-
-    payload = {
-        "sport": sport,
+    stamp = datetime.now(ZoneInfo("America/New_York")).strftime("%m/%d %I:%M %p")
+    return jsonify({
+        "as_of_est": stamp,
         "bookmaker": bookmaker,
-        "as_of_est": datetime.now(NY_TZ).strftime("%m/%d %I:%M %p"),
-        "games": results,
-    }
-    set_cached(ck, payload)
-    return jsonify(payload)
+        "sport": sport,
+        "games": parsed
+    })
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5050"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # For local dev
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5050")), debug=True)

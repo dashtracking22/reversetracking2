@@ -1,63 +1,33 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>betkarma — Cash Bros LLC</title>
+  <meta charset="utf-8">
+  <title>Reverse — The Odds Tracking App</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header class="site-header">
-    <h1>Cash Bros LLC — betkarma</h1>
+    <div class="title">Reverse — The Odds Tracking App</div>
     <div class="controls">
-      <label>
-        Sport
-        <select id="sportSelect" aria-label="Select sport"></select>
-      </label>
-      <label>
-        Bookmaker
-        <select id="bookmakerSelect" aria-label="Select bookmaker"></select>
-      </label>
-      <label>
-        Day
-        <select id="daysSelect" aria-label="Select day filter">
-          <option value="all">All</option>
-          <option value="0">Today</option>
-          <option value="1">Tomorrow</option>
-          <option value="2">+2</option>
-          <option value="3">+3</option>
-        </select>
-      </label>
-      <button id="refreshBtn" title="Bypass cache and refetch (r)">Refresh</button>
-      <span id="asOf" class="asof"></span>
+      <div class="chip-row" id="dateChips"></div>
+      <div class="selectors">
+        <label>
+          Sport
+          <select id="sportSelect"></select>
+        </label>
+        <label>
+          Bookmaker
+          <select id="bookmakerSelect"></select>
+        </label>
+        <button id="loadBtn">Load Odds</button>
+      </div>
     </div>
+    <div class="asof" id="asOfText"></div>
   </header>
 
-  <main id="content"></main>
+  <main id="cards"></main>
 
-  <template id="gameCardTpl">
-    <section class="game-card">
-      <div class="game-head">
-        <div class="matchup"></div>
-        <div class="kickoff"></div>
-      </div>
-      <div class="markets">
-        <div class="market">
-          <h3>Moneyline</h3>
-          <div class="rows"></div>
-        </div>
-        <div class="market">
-          <h3>Spread</h3>
-          <div class="rows"></div>
-        </div>
-        <div class="market">
-          <h3>Total</h3>
-          <div class="rows"></div>
-        </div>
-      </div>
-    </section>
-  </template>
-
-  <script src="/app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

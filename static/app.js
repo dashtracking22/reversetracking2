@@ -1,250 +1,198 @@
-// --------- DOM helpers ----------
-const $  = (s, r = document) => r.querySelector(s);
-const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const sportSelect = document.getElementById("sportSelect");
+const bookmakerSelect = document.getElementById("bookmakerSelect");
+const loadBtn = document.getElementById("loadBtn");
+const cards = document.getElementById("cards");
+const asOfText = document.getElementById("asOfText");
+const dateChips = document.getElementById("dateChips");
 
-// --------- Elements -------------
-const sportSelect     = $("#sportSelect");
-const bookmakerSelect = $("#bookmakerSelect");
-const daysSelect      = $("#daysSelect");
-const refreshBtn      = $("#refreshBtn");
-const content         = $("#content");
-const asOfEl          = $("#asOf");
-const gameCardTpl     = $("#gameCardTpl");
+let currentDayOffset = 0;
 
-// --------- State / prefs --------
-const LS = {
-  SPORT: "bk.sport",
-  BOOK: "bk.book",
-  DAYS: "bk.days"
-};
+init();
 
-const DEFAULTS = {
-  sport: "baseball_mlb",
-  book: "betonlineag",
-  days: "all",
-};
-
-function savePrefs() {
-  try {
-    localStorage.setItem(LS.SPORT, sportSelect.value || "");
-    localStorage.setItem(LS.BOOK, bookmakerSelect.value || "");
-    localStorage.setItem(LS.DAYS, daysSelect.value || "all");
-  } catch {}
-}
-function loadPrefs() {
-  try {
-    return {
-      sport: localStorage.getItem(LS.SPORT) || null,
-      book: localStorage.getItem(LS.BOOK) || null,
-      days: localStorage.getItem(LS.DAYS) || null,
-    };
-  } catch { return { sport: null, book: null, days: null }; }
+async function init(){
+  makeDateChips();
+  await populateSports();
+  await populateBookmakers();
+  loadBtn.addEventListener("click", loadOdds);
+  await loadOdds();
 }
 
-// --------- Fetch util -----------
-async function fetchJSON(url) {
-  const res = await fetch(url, { headers: { "Accept": "application/json" } });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status} ${t}`);
-  }
-  return res.json();
-}
-
-// --------- Skeleton UI ----------
-function skeletonCards(n = 4) {
-  const frag = document.createDocumentFragment();
-  for (let i = 0; i < n; i++) {
-    const sec = document.createElement("section");
-    sec.className = "game-card skeleton";
-    sec.innerHTML = `
-      <div class="game-head">
-        <div class="matchup sk-bar"></div>
-        <div class="kickoff sk-pill"></div>
-      </div>
-      <div class="markets">
-        <div class="market">
-          <h3>Moneyline</h3>
-          <div class="rows">
-            <div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div>
-            <div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div>
-          </div>
-        </div>
-        <div class="market"><h3>Spread</h3><div class="rows"><div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div></div></div>
-        <div class="market"><h3>Total</h3><div class="rows"><div class="row"><div class="cell team sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div><div class="cell sk-pill"></div><div class="cell sk-bar"></div></div></div></div>
-      </div>`;
-    frag.appendChild(sec);
-  }
-  return frag;
-}
-function setLoading(on) {
-  if (on) {
-    content.innerHTML = "";
-    content.appendChild(skeletonCards(4));
-    asOfEl.textContent = "Loading…";
-    refreshBtn.disabled = sportSelect.disabled = bookmakerSelect.disabled = daysSelect.disabled = true;
-  } else {
-    refreshBtn.disabled = sportSelect.disabled = bookmakerSelect.disabled = daysSelect.disabled = false;
+function makeDateChips(){
+  // 6 chips: today + next 5 days
+  dateChips.innerHTML = "";
+  const now = new Date();
+  for(let i=0;i<6;i++){
+    const d = new Date(now.getTime() + i*24*3600*1000);
+    const chip = document.createElement("button");
+    chip.className = "chip" + (i===0 ? " active" : "");
+    chip.textContent = d.toLocaleDateString(undefined, {weekday:"short", month:"short", day:"numeric"});
+    chip.addEventListener("click", ()=>{
+      currentDayOffset = i;
+      [...dateChips.children].forEach(c=>c.classList.remove("active"));
+      chip.classList.add("active");
+      loadOdds();
+    });
+    dateChips.appendChild(chip);
   }
 }
 
-// --------- Render helpers -------
-function esc(s) { return (s ?? "").toString()
-  .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-  .replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
-
-function sign(v) {
-  if (v === null || v === undefined) return "-";
-  const n = Number(v); if (Number.isNaN(n)) return "-";
-  return n > 0 ? `+${n}` : `${n}`;
-}
-function diffCls(v){
-  if (typeof v !== "number" || Number.isNaN(v)) return "";
-  return v > 0 ? "diff-pos" : v < 0 ? "diff-neg" : "";
-}
-function joinPointPrice(point, price) {
-  const hasPoint = point !== null && point !== undefined;
-  const hasPrice = price !== null && price !== undefined && `${price}` !== "";
-  if (!hasPoint && !hasPrice) return "-";
-  return hasPrice ? `${point ?? "-"} (${price})` : `${point ?? "-"}`;
-}
-
-// --------- Days filter ----------
-function dayOffsetFromNow(isoStr) {
-  if (!isoStr) return null;
-  try {
-    const d = new Date(isoStr);            // ISO → Date (UTC)
-    const now = new Date();                // local
-    // Normalize both to local midnight
-    const localD = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-    const localNow = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const diffMs = localD - localNow;
-    return Math.round(diffMs / 86400000);
-  } catch { return null; }
-}
-
-function filterByDays(games, mode) {
-  if (mode === "all") return games;
-  const want = Number(mode);
-  return games.filter(g => {
-    const off = dayOffsetFromNow(g.commence_time_iso);
-    return off === want;
+async function populateSports(){
+  const r = await fetch("/sports");
+  const data = await r.json();
+  sportSelect.innerHTML = "";
+  (data.sports || []).forEach(s=>{
+    const opt = document.createElement("option");
+    opt.value = s; opt.textContent = labelizeSport(s);
+    sportSelect.appendChild(opt);
   });
 }
 
-// --------- Rendering ------------
-function renderGames(payload) {
-  content.innerHTML = "";
-  asOfEl.textContent = `As of ${payload.as_of_est} — ${String(payload.bookmaker || "").toUpperCase()}`;
+async function populateBookmakers(){
+  const r = await fetch("/bookmakers");
+  const data = await r.json();
+  bookmakerSelect.innerHTML = "";
+  (data.bookmakers || []).forEach(b=>{
+    const opt = document.createElement("option");
+    opt.value = b; opt.textContent = titleCase(b);
+    bookmakerSelect.appendChild(opt);
+  });
+  if(data.default){
+    bookmakerSelect.value = data.default;
+  }
+}
 
-  let games = payload.games || [];
-  games = filterByDays(games, daysSelect.value || "all");
+async function loadOdds(){
+  cards.innerHTML = `<div class="badge">Loading…</div>`;
+  try{
+    const params = new URLSearchParams({
+      sport: sportSelect.value,
+      bookmaker: bookmakerSelect.value,
+      day_offset: String(currentDayOffset)
+    });
+    const r = await fetch(`/odds?${params.toString()}`);
+    const data = await r.json();
+    if(!r.ok){
+      throw new Error(data.error || "Failed to load odds");
+    }
+    renderOdds(data);
+  }catch(err){
+    cards.innerHTML = `<div class="badge">Error: ${err.message}</div>`;
+  }
+}
 
-  if (!games.length) {
-    content.innerHTML = `<div class="error">No games for this selection.</div>`;
+function renderOdds(payload){
+  asOfText.textContent = `As of ${payload.as_of_est}, book: ${titleCase(payload.bookmaker)}`;
+  const games = payload.games || [];
+  if(games.length === 0){
+    cards.innerHTML = `<div class="badge">No games found for selected day.</div>`;
     return;
   }
 
-  const frag = document.createDocumentFragment();
-  for (const g of games) {
-    const node = gameCardTpl.content.cloneNode(true);
-    $(".matchup", node).textContent = `${g.away_team} @ ${g.home_team}`;
-    $(".kickoff", node).textContent = g.commence_time_est || "";
-
-    const containers = $$(".market .rows", node);
-    const ml = containers[0], sp = containers[1], tot = containers[2];
-
-    (g.moneyline || []).forEach(r => {
-      ml.insertAdjacentHTML("beforeend", `
-        <div class="row">
-          <div class="cell team">${esc(r.team)}</div>
-          <div class="cell">Open</div><div class="cell">${r.open_price ?? "-"}</div>
-          <div class="cell">Live</div><div class="cell">${r.live_price ?? "-"}</div>
-          <div class="cell">Diff</div><div class="cell ${diffCls(r.diff_price)}">${sign(r.diff_price)}</div>
-        </div>`);
-    });
-
-    (g.spreads || []).forEach(r => {
-      sp.insertAdjacentHTML("beforeend", `
-        <div class="row">
-          <div class="cell team">${esc(r.team)}</div>
-          <div class="cell">Open</div><div class="cell">${joinPointPrice(r.open_point, r.open_price)}</div>
-          <div class="cell">Live</div><div class="cell">${joinPointPrice(r.live_point, r.live_price)}</div>
-          <div class="cell">Diff</div><div class="cell ${diffCls(r.diff_point)}">${sign(r.diff_point)}</div>
-        </div>`);
-    });
-
-    (g.totals || []).forEach(r => {
-      tot.insertAdjacentHTML("beforeend", `
-        <div class="row">
-          <div class="cell team">${esc(r.team)}</div>
-          <div class="cell">Open</div><div class="cell">${joinPointPrice(r.open_point, r.open_price)}</div>
-          <div class="cell">Live</div><div class="cell">${joinPointPrice(r.live_point, r.live_price)}</div>
-          <div class="cell">Diff</div><div class="cell ${diffCls(r.diff_point)}">${sign(r.diff_point)}</div>
-        </div>`);
-    });
-
-    frag.appendChild(node);
-  }
-  content.appendChild(frag);
+  cards.innerHTML = games.map(g => renderCard(g)).join("");
 }
 
-// --------- Loaders --------------
-async function loadSports() {
-  const data = await fetchJSON("/sports");
-  const sports = data.sports || [];
-  sportSelect.innerHTML = sports.map(s => `<option value="${s.key}">${esc(s.label)}</option>`).join("");
-  const prefs = loadPrefs();
-  const pick = (prefs.sport && sports.some(s => s.key === prefs.sport) && prefs.sport) || (sports[0]?.key) || DEFAULTS.sport;
-  sportSelect.value = pick;
+function renderCard(g){
+  const home = safe(g.home_team);
+  const away = safe(g.away_team);
+
+  const mlRows = (g.moneyline || []).map(row => {
+    const team = safe(row.team);
+    const open = "—";
+    const live = row.live_price ?? "—";
+    const diff = "—";
+    return `<tr>
+      <td>${team}</td>
+      <td class="num">${open}</td>
+      <td class="num">${fmtNum(live)}</td>
+      <td class="num">${diff}</td>
+    </tr>`;
+  }).join("");
+
+  const spreadRows = (g.spreads || []).map(row => {
+    const team = safe(row.team);
+    const open = "—";
+    const lp = row.live_point;
+    const lprice = row.live_price;
+    const live = (lp != null && lprice != null) ? `${signed(lp)} (${fmtNum(lprice)})` : "—";
+    const diff = "—";
+    return `<tr>
+      <td>${team}</td>
+      <td class="num">${open}</td>
+      <td class="num">${live}</td>
+      <td class="num">${diff}</td>
+    </tr>`;
+  }).join("");
+
+  const totalRows = (g.totals || []).map(row => {
+    const team = safe(row.team); // Over / Under
+    const open = "—";
+    const lp = row.live_point;
+    const lprice = row.live_price;
+    const live = (lp != null && lprice != null) ? `${lp} (${fmtNum(lprice)})` : "—";
+    const diff = "—";
+    return `<tr>
+      <td>${team}</td>
+      <td class="num">${open}</td>
+      <td class="num">${live}</td>
+      <td class="num">${diff}</td>
+    </tr>`;
+  }).join("");
+
+  return `
+  <section class="card">
+    <div class="card-header">
+      <div class="card-title">${away}  @  ${home}</div>
+      <div class="badge">${g.commence_time_est}</div>
+    </div>
+
+    <div class="section">
+      <h4>MONEYLINE</h4>
+      <table class="table">
+        <thead><tr><th>Team</th><th>Open</th><th>Live</th><th>Diff</th></tr></thead>
+        <tbody>${mlRows}</tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h4>SPREAD</h4>
+      <table class="table">
+        <thead><tr><th>Team</th><th>Open</th><th>Live</th><th>Diff</th></tr></thead>
+        <tbody>${spreadRows}</tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h4>TOTAL</h4>
+      <table class="table">
+        <thead><tr><th>Team</th><th>Open</th><th>Live</th><th>Diff</th></tr></thead>
+        <tbody>${totalRows}</tbody>
+      </table>
+    </div>
+  </section>`;
 }
 
-async function loadBooks() {
-  const data = await fetchJSON("/bookmakers");
-  const books = data.bookmakers || [];
-  bookmakerSelect.innerHTML = books.map(b => `<option value="${b}">${esc(b)}</option>`).join("");
-  const prefs = loadPrefs();
-  const pick = (prefs.book && books.includes(prefs.book) && prefs.book) || (books[0]) || DEFAULTS.book;
-  bookmakerSelect.value = pick;
-  daysSelect.value = loadPrefs().days || DEFAULTS.days;
+function labelizeSport(key){
+  const map = {
+    americanfootball_ncaaf: "NCAAF",
+    americanfootball_nfl: "NFL",
+    baseball_mlb: "MLB",
+    basketball_wnba: "WNBA",
+    mma_mixed_martial_arts: "MMA",
+  };
+  return map[key] || key;
 }
 
-async function loadOdds({ refresh = false } = {}) {
-  const sport = sportSelect.value || DEFAULTS.sport;
-  const book  = bookmakerSelect.value || DEFAULTS.book;
-  const url = `/odds/${encodeURIComponent(sport)}?bookmaker=${encodeURIComponent(book)}${refresh ? "&refresh=1" : ""}`;
-
-  setLoading(true);
-  try {
-    const payload = await fetchJSON(url);
-    renderGames(payload);
-  } catch (e) {
-    console.error(e);
-    content.innerHTML = `<div class="error">Error loading odds: ${String(e.message || e)}</div>`;
-  } finally {
-    setLoading(false);
-  }
+function titleCase(s){
+  return s.replace(/[_-]/g," ").replace(/\b\w/g, c => c.toUpperCase());
 }
 
-// --------- Events ---------------
-refreshBtn.addEventListener("click", () => { savePrefs(); loadOdds({ refresh: true }); });
-sportSelect.addEventListener("change", () => { savePrefs(); loadOdds({ refresh: true }); });
-bookmakerSelect.addEventListener("change", () => { savePrefs(); loadOdds({ refresh: true }); });
-daysSelect.addEventListener("change", () => { savePrefs(); loadOdds({ refresh: false }); });
-
-document.addEventListener("keydown", (e) => {
-  if (e.key.toLowerCase() === "r" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-    e.preventDefault(); refreshBtn.click();
-  }
-});
-
-// --------- Init -----------------
-(async function init(){
-  try {
-    await Promise.all([loadSports(), loadBooks()]);
-    await loadOdds({ refresh: true });
-  } catch (e) {
-    console.error(e);
-    content.innerHTML = `<div class="error">Startup failed: ${String(e.message || e)}</div>`;
-  }
-})();
+function fmtNum(v){
+  if (v === null || v === undefined || v === "") return "—";
+  return String(v);
+}
+function signed(v){
+  if (v === null || v === undefined) return "";
+  const n = Number(v);
+  return n > 0 ? `+${n}` : String(n);
+}
+function safe(s){ return (s ?? "").toString(); }
