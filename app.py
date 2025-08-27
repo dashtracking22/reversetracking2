@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # -----------------------------
-# Flask (serves ./static at / )
+# Flask setup
 # -----------------------------
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
@@ -57,40 +57,24 @@ UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL", "") or "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "") or ""
 
 REDIS_DEBUG = os.getenv("REDIS_DEBUG", "") in ("1", "true", "TRUE", "yes", "YES")
-ODDS_DEBUG  = os.getenv("ODDS_DEBUG", "")  in ("1", "true", "TRUE", "yes", "YES")
 
 _http = requests.Session()
 
 def has_upstash() -> bool:
-    ok = bool(UPSTASH_URL and UPSTASH_TOKEN)
-    if REDIS_DEBUG and not ok:
-        print("[REDIS] Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN")
-    return ok
+    return bool(UPSTASH_URL and UPSTASH_TOKEN)
 
 def _redis_call(cmd: str, *args, params: Optional[dict] = None):
-    """Upstash REST helper. Uses POST+body for SET, GET for others."""
+    """Upstash REST helper using path-args style (works with your curl)."""
     if not has_upstash():
         return None
     cmd_path = cmd.upper()
+    url_parts = [UPSTASH_URL, cmd_path] + [requests.utils.quote(str(a), safe="") for a in args]
+    url = "/".join(url_parts)
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-
     try:
-        if cmd_path == "SET":
-            # args: key, value
-            key, value = args
-            payload = {"key": key, "value": value}
-            if params:
-                payload.update(params)
-            url = f"{UPSTASH_URL}/{cmd_path}"
-            resp = _http.post(url, headers=headers, json=payload, timeout=10)
-        else:
-            url_parts = [UPSTASH_URL, cmd_path] + [requests.utils.quote(str(a), safe="") for a in args]
-            url = "/".join(url_parts)
-            resp = _http.get(url, headers=headers, params=params, timeout=10)
-
+        resp = _http.get(url, headers=headers, params=params, timeout=10)
         if REDIS_DEBUG:
-            print(f"[REDIS] {cmd_path} status={resp.status_code} body={resp.text[:200]}")
-
+            print(f"[REDIS] {cmd_path} {url} status={resp.status_code} body={resp.text[:200]}")
         resp.raise_for_status()
         data = resp.json()
         return data.get("result")
@@ -103,10 +87,8 @@ def _opening_key(sport, book, event_id, market, side):
     return f"opening:{sport}:{book}:{event_id}:{market}:{side}"
 
 def save_opening_once(sport, book, event_id, side, market, price=None, point=None, ttl_days=60):
-    """Save opening once with NX; avoid locking in blanks."""
     if not has_upstash():
         return None
-
     if market == "moneyline" and price is None:
         return None
     if market in ("spread", "total") and point is None:
@@ -117,7 +99,7 @@ def save_opening_once(sport, book, event_id, side, market, price=None, point=Non
     value = json.dumps(payload, separators=(",", ":"))
 
     try:
-        _redis_call("SET", key, value, params={"NX": True, "EX": ttl_days * 24 * 3600})
+        _redis_call("SET", key, value, params={"NX": "true", "EX": str(ttl_days * 24 * 3600)})
     except Exception as e:
         if REDIS_DEBUG:
             print(f"[REDIS] save_opening_once SET error: {e}")
@@ -150,7 +132,7 @@ def compute_diff(current_price=None, current_point=None, opening=None):
     return {"price_diff": price_diff, "point_diff": point_diff}
 
 # -----------------------------
-# Odds API
+# Odds API helpers
 # -----------------------------
 def _cache_key(*parts): return "|".join(str(p) for p in parts)
 
@@ -219,7 +201,7 @@ def redis_ping():
 @app.get("/redis-selftest")
 def redis_selftest():
     key = "selftest:hello"
-    _redis_call("SET", key, json.dumps({"v": "world"}), params={"EX": 60})
+    _redis_call("SET", key, json.dumps({"v": "world"}), params={"EX": "60"})
     got = _redis_call("GET", key)
     return jsonify({"ok": True, "key": key, "value": got})
 
@@ -253,7 +235,6 @@ def odds_for_sport(sport):
             "sport": sport,
             "bookmaker": bookmaker,
             "commence_time_est": iso_to_est_str(game.get("commence_time")),
-            "commence_time_iso": game.get("commence_time"),
             "home_team": game.get("home_team"),
             "away_team": game.get("away_team"),
             "moneyline": [],
