@@ -162,22 +162,12 @@ function renderCard(g){
   </section>`;
 }
 
-/* ===== utils ===== */
+/* utils */
 function labelSport(key){
-  const map = {
-    baseball_mlb: "MLB",
-    mma_mixed_martial_arts: "MMA",
-    basketball_wnba: "WNBA",
-    americanfootball_nfl: "NFL",
-    americanfootball_ncaaf: "NCAAF",
-  };
+  const map = { americanfootball_ncaaf:"NCAAF", americanfootball_nfl:"NFL", baseball_mlb:"MLB", basketball_wnba:"WNBA", mma_mixed_martial_arts:"MMA" };
   return map[key] || key;
 }
-function titleCase(s){ return (s||"").replace(/[_-]/g," ").replace(/\b\w/g, c=>c.toUpperCase()); }
+function titleCase(s){ return (s||"").replace(/[_-]/g," ").replace(/\b\w/g,c=>c.toUpperCase()); }
 function fmt(v){ return (v === null || v === undefined || v === "") ? "—" : String(v); }
-function signed(v){
-  if (v === null || v === undefined || v === "") return "—";
-  const n = Number(v); if (Number.isNaN(n)) return String(v);
-  return n > 0 ? `+${n}` : String(n);
-}
+function signed(v){ if (v === null || v === undefined || v === "") return "—"; const n=Number(v); return Number.isNaN(n)?String(v): (n>0?`+${n}`:String(n)); }
 function safe(s){ return (s ?? "").toString(); }
