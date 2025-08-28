@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, Any
@@ -18,28 +19,33 @@ app.logger.setLevel(logging.INFO)
 API_KEY = os.getenv("API_KEY")
 BASE_URL = "https://api.the-odds-api.com/v4"
 
+# Trim if you want fewer sports (lighter):
 ALLOWED_SPORTS = [
     "baseball_mlb",
-    "mma_mixed_martial_arts",
-    "basketball_wnba",
     "americanfootball_nfl",
-    "americanfootball_ncaaf",
+    # "americanfootball_ncaaf",
+    # "basketball_wnba",
+    # "mma_mixed_martial_arts",
 ]
 DEFAULT_SPORT = "baseball_mlb"
 
 ALLOWED_BOOKMAKERS = ["draftkings", "betonlineag", "fanduel", "caesars"]
-DEFAULT_BOOKMAKER = "draftkings"
+DEFAULT_BOOKMAKER = "betonlineag"
 
 UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
 
 OPEN_TTL = 7 * 24 * 3600  # 7 days
 
+# --- tiny in-memory cache for /odds responses (per dyno) ---
+_odds_cache: dict[tuple, tuple[float, dict]] = {}
+ODDS_CACHE_TTL = 15  # seconds
+
 # ===================== Redis helpers =====================
 def _redis_headers():
     return {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
 
-def _json_get(url: str, timeout: int = 10) -> dict:
+def _json_get(url: str, timeout: int = 12) -> dict:
     r = requests.get(url, headers=_redis_headers(), timeout=timeout)
     r.raise_for_status()
     return r.json()
@@ -167,7 +173,7 @@ def sports():
 def bookmakers():
     return jsonify({"bookmakers": ALLOWED_BOOKMAKERS, "default": DEFAULT_BOOKMAKER})
 
-# -------- Odds (reads + diffs) --------
+# -------- Odds (lazy-seeds openings + returns diffs) --------
 @app.route("/odds")
 def odds():
     try:
@@ -187,6 +193,14 @@ def odds():
             day_offset = max(0, min(day_offset, 30))
         except ValueError:
             day_offset = 0
+
+        # in-memory cache to reduce upstream hits
+        cache_key = (sport, bookmaker, day_offset)
+        now = time.time()
+        if cache_key in _odds_cache:
+            ts, payload = _odds_cache[cache_key]
+            if now - ts <= ODDS_CACHE_TTL:
+                return jsonify(payload)
 
         params = {
             "apiKey": API_KEY,
@@ -212,6 +226,32 @@ def odds():
             except Exception:
                 return False
 
+        def get_h2h(mkts_local):
+            d = {}
+            for m in mkts_local:
+                if m.get("key") == "h2h":
+                    for o in m.get("outcomes", []):
+                        d[o.get("name")] = o.get("price")
+            return d
+
+        def get_spreads(mkts_local):
+            d = {}
+            for m in mkts_local:
+                if m.get("key") == "spreads":
+                    for o in m.get("outcomes", []):
+                        d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
+            return d
+
+        def get_totals(mkts_local):
+            arr = []
+            for m in mkts_local:
+                if m.get("key") == "totals":
+                    for o in m.get("outcomes", []):
+                        arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
+            if len(arr) == 2:
+                arr.sort(key=lambda x: 0 if (x["team"] or "").lower().startswith("over") else 1)
+            return arr
+
         games = []
         for ev in events:
             if not in_window(ev.get("commence_time", "")):
@@ -222,33 +262,6 @@ def odds():
                 continue
 
             mkts = bm.get("markets", [])
-
-            def get_h2h(mkts_local):
-                d = {}
-                for m in mkts_local:
-                    if m.get("key") == "h2h":
-                        for o in m.get("outcomes", []):
-                            d[o.get("name")] = o.get("price")
-                return d
-
-            def get_spreads(mkts_local):
-                d = {}
-                for m in mkts_local:
-                    if m.get("key") == "spreads":
-                        for o in m.get("outcomes", []):
-                            d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
-                return d
-
-            def get_totals(mkts_local):
-                arr = []
-                for m in mkts_local:
-                    if m.get("key") == "totals":
-                        for o in m.get("outcomes", []):
-                            arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
-                if len(arr) == 2:
-                    arr.sort(key=lambda x: 0 if (x["team"] or "").lower().startswith("over") else 1)
-                return arr
-
             h2h = get_h2h(mkts)
             spreads = get_spreads(mkts)
             totals = get_totals(mkts)
@@ -263,7 +276,7 @@ def odds():
             home = ev.get("home_team")
             event_id = ev.get("id")
 
-            # Moneyline
+            # Moneyline openings/diffs
             ml_rows = []
             for team in [away, home]:
                 live_price = h2h.get(team)
@@ -284,7 +297,7 @@ def odds():
                     "diff_price": diff_price
                 })
 
-            # Spreads
+            # Spread openings/diffs (points only)
             sp_rows = []
             for team in [away, home]:
                 row = (spreads.get(team) or {})
@@ -294,7 +307,7 @@ def odds():
                 if team is not None:
                     kp = key_spread_point(sport, event_id, team)
                     open_point = get_or_set_opening(kp, lp)
-                    # store price too for future use (not diffing yet)
+                    # store price for completeness (not diffing)
                     kpp = key_spread_price(sport, event_id, team)
                     _ = get_or_set_opening(kpp, lprice)
                 diff_point = None
@@ -312,7 +325,7 @@ def odds():
                     "diff_point": diff_point
                 })
 
-            # Totals
+            # Totals openings/diffs (points only)
             tot_rows = []
             for row in totals:
                 ou_lab = row.get("team")
@@ -351,147 +364,20 @@ def odds():
                 "totals": tot_rows,
             })
 
-        return jsonify({
+        payload = {
             "as_of_est": datetime.now(ZoneInfo("America/New_York")).strftime("%m/%d %I:%M %p"),
             "bookmaker": bookmaker,
             "sport": sport,
             "games": games,
-        })
+        }
+        _odds_cache[cache_key] = (now, payload)
+        return jsonify(payload)
+
     except requests.RequestException as e:
         return jsonify({"error": f"Odds API error: {e}"}), 502
     except Exception as e:
         app.logger.exception("/odds crashed")
         return jsonify({"error": f"odds_handler_exception: {e}"}), 502
-
-# -------- Seed openings (GET + POST) --------
-@app.route("/seed_openings", methods=["GET", "POST"])
-def seed_openings():
-    try:
-        if not API_KEY:
-            return jsonify({"error": "Missing API_KEY"}), 500
-
-        if request.method == "GET":
-            sport = request.args.get("sport", DEFAULT_SPORT)
-            bookmaker = request.args.get("bookmaker", DEFAULT_BOOKMAKER)
-            try:
-                day_offset = int(request.args.get("day_offset", "0"))
-            except ValueError:
-                day_offset = 0
-        else:
-            sport = request.values.get("sport", DEFAULT_SPORT)
-            bookmaker = request.values.get("bookmaker", DEFAULT_BOOKMAKER)
-            try:
-                day_offset = int(request.values.get("day_offset", "0"))
-            except ValueError:
-                day_offset = 0
-        day_offset = max(0, min(day_offset, 30))
-
-        params = {
-            "apiKey": API_KEY,
-            "regions": "us",
-            "markets": "h2h,spreads,totals",
-            "bookmakers": bookmaker,
-            "oddsFormat": "american",
-            "dateFormat": "iso",
-        }
-
-        r = requests.get(f"{BASE_URL}/sports/{sport}/odds", params=params, timeout=20)
-        r.raise_for_status()
-        events = r.json()
-
-        et = ZoneInfo("America/New_York")
-        start_day = datetime.now(et).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=day_offset)
-        end_day = start_day + timedelta(days=1)
-
-        def in_window(iso_str: str) -> bool:
-            try:
-                dt_et = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone(et)
-                return start_day <= dt_et < end_day
-            except Exception:
-                return False
-
-        def get_h2h(mkts_local):
-            d = {}
-            for m in mkts_local:
-                if m.get("key") == "h2h":
-                    for o in m.get("outcomes", []):
-                        d[o.get("name")] = o.get("price")
-            return d
-
-        def get_spreads(mkts_local):
-            d = {}
-            for m in mkts_local:
-                if m.get("key") == "spreads":
-                    for o in m.get("outcomes", []):
-                        d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
-            return d
-
-        def get_totals(mkts_local):
-            arr = []
-            for m in mkts_local:
-                if m.get("key") == "totals":
-                    for o in m.get("outcomes", []):
-                        arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
-            return arr
-
-        seeded = 0
-        scanned = 0
-
-        for ev in events:
-            if not in_window(ev.get("commence_time", "")):
-                continue
-            bm = next((b for b in ev.get("bookmakers", []) if b.get("key") == bookmaker), None)
-            if not bm:
-                continue
-            scanned += 1
-            mkts = bm.get("markets", [])
-            h2h = get_h2h(mkts)
-            spreads = get_spreads(mkts)
-            totals = get_totals(mkts)
-
-            event_id = ev.get("id")
-            away = ev.get("away_team")
-            home = ev.get("home_team")
-
-            # Moneyline openings
-            for team in [away, home]:
-                if team and h2h.get(team) is not None:
-                    created, _ = redis_setnx_encoded(key_ml(sport, event_id, team), str(h2h[team]), ex_seconds=OPEN_TTL)
-                    if created:
-                        seeded += 1
-
-            # Spreads (points)
-            for team in [away, home]:
-                if not team:
-                    continue
-                row = spreads.get(team) or {}
-                if row.get("point") is not None:
-                    created, _ = redis_setnx_encoded(key_spread_point(sport, event_id, team), str(row["point"]), ex_seconds=OPEN_TTL)
-                    if created:
-                        seeded += 1
-
-            # Totals (points)
-            for row in totals:
-                ou = row.get("team")
-                p = row.get("point")
-                if ou and p is not None:
-                    created, _ = redis_setnx_encoded(key_total_point(sport, event_id, ou), str(p), ex_seconds=OPEN_TTL)
-                    if created:
-                        seeded += 1
-
-        return jsonify({
-            "ok": True,
-            "sport": sport,
-            "bookmaker": bookmaker,
-            "day_offset": day_offset,
-            "scanned_games": scanned,
-            "seeded_fields": seeded
-        }), 200
-    except requests.RequestException as e:
-        return jsonify({"error": f"Odds API error: {e}"}), 502
-    except Exception as e:
-        app.logger.exception("/seed_openings crashed")
-        return jsonify({"error": f"seed_handler_exception: {e}"}), 502
 
 # -------- Debug / Health --------
 @app.route("/healthz")
@@ -506,10 +392,6 @@ def debug_env():
         "has_UPSTASH_TOKEN": bool(UPSTASH_TOKEN),
         "upstash_url_sample": (UPSTASH_URL[:30] + "...") if UPSTASH_URL else None
     })
-
-@app.route("/debug/boot")
-def debug_boot():
-    return jsonify({"booted_at_est": datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")})
 
 @app.route("/debug/redis/ping")
 def debug_ping_route():
