@@ -38,8 +38,11 @@ UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or "").rstrip("/")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or ""
 
 def _redis_headers():
-    return {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
+    h = {"Authorization": f"Bearer {UPSTASH_TOKEN}"} if UPSTASH_TOKEN else {}
+    h["Content-Type"] = "application/json"
+    return h
 
+# ---- Basic ping / get ----
 def redis_ping() -> Tuple[Optional[str], Optional[str]]:
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return None, "Missing Upstash env vars"
@@ -51,7 +54,6 @@ def redis_ping() -> Tuple[Optional[str], Optional[str]]:
         return None, str(e)
 
 def redis_get(key: str) -> Tuple[Optional[str], Optional[str]]:
-    """GET with URL-encoded key."""
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return None, "Missing Upstash env vars"
     try:
@@ -62,17 +64,22 @@ def redis_get(key: str) -> Tuple[Optional[str], Optional[str]]:
     except Exception as e:
         return None, str(e)
 
+# ---- Robust SET / SETNX via POST JSON ----
 def redis_setnx(key: str, value: Any, ex_seconds: Optional[int] = None) -> Tuple[bool, Optional[str]]:
-    """SET key value NX with URL-encoded key & value. Returns True if created."""
+    """
+    POST /set/{key} with JSON: { value, nx: true, ex }
+    Returns True if key was created (opening seeded), False if it existed already.
+    """
     if not (UPSTASH_URL and UPSTASH_TOKEN):
         return False, "Missing Upstash env vars"
     try:
-        k = quote(key, safe=""); v = quote(str(value), safe="")
-        url = f"{UPSTASH_URL}/set/{k}/{v}?nx=true"
+        k = quote(key, safe="")
+        body = {"value": str(value), "nx": True}
         if ex_seconds is not None:
-            url += f"&ex={int(ex_seconds)}"
-        r = requests.get(url, headers=_redis_headers(), timeout=8)
+            body["ex"] = int(ex_seconds)
+        r = requests.post(f"{UPSTASH_URL}/set/{k}", headers=_redis_headers(), json=body, timeout=8)
         r.raise_for_status()
+        # Upstash returns {"result":"OK"} when written, {"result":None} if NX failed
         return r.json().get("result") == "OK", None
     except Exception as e:
         app.logger.error("Redis SETNX failed key=%s val=%s err=%s", key, value, e)
@@ -110,20 +117,18 @@ def get_or_set_opening(key: str, current_value: Optional[Any]) -> Optional[float
     existing, err = redis_get(key)
     if err is None and existing is not None:
         return _to_float(existing)
-
     if current_value is None:
         return None
-
+    # First viewer writes opening (once) with TTL
     redis_setnx(key, current_value, ex_seconds=OPEN_TTL)
     stored, _ = redis_get(key)
     return _to_float(stored)
 
-# ===== Static root =====
+# ===== Routes =====
 @app.route("/")
 def home():
     return send_from_directory(app.static_folder, "index.html")
 
-# ===== Dropdown data =====
 @app.route("/sports")
 def sports():
     return jsonify({"sports": ALLOWED_SPORTS, "default": DEFAULT_SPORT})
@@ -131,6 +136,19 @@ def sports():
 @app.route("/bookmakers")
 def bookmakers():
     return jsonify({"bookmakers": ALLOWED_BOOKMAKERS, "default": DEFAULT_BOOKMAKER})
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True, "time": datetime.utcnow().isoformat() + "Z"})
+
+@app.route("/debug/env")
+def debug_env():
+    return jsonify({
+        "has_API_KEY": bool(API_KEY),
+        "has_UPSTASH_URL": bool(UPSTASH_URL),
+        "has_UPSTASH_TOKEN": bool(UPSTASH_TOKEN),
+        "upstash_url_sample": (UPSTASH_URL[:30] + "...") if UPSTASH_URL else None
+    })
 
 # ===== Odds endpoint (populates opening + diff) =====
 @app.route("/odds")
@@ -179,6 +197,32 @@ def odds():
         except Exception:
             return False
 
+    def get_h2h(mkts_local):
+        d = {}
+        for m in mkts_local:
+            if m.get("key") == "h2h":
+                for o in m.get("outcomes", []):
+                    d[o.get("name")] = o.get("price")
+        return d
+
+    def get_spreads(mkts_local):
+        d = {}
+        for m in mkts_local:
+            if m.get("key") == "spreads":
+                for o in m.get("outcomes", []):
+                    d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
+        return d
+
+    def get_totals(mkts_local):
+        arr = []
+        for m in mkts_local:
+            if m.get("key") == "totals":
+                for o in m.get("outcomes", []):
+                    arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
+        if len(arr) == 2:
+            arr.sort(key=lambda x: 0 if (x["team"] or "").lower().startswith("over") else 1)
+        return arr
+
     games = []
     for ev in events:
         if not in_window(ev.get("commence_time", "")):
@@ -189,33 +233,6 @@ def odds():
             continue
 
         mkts = bm.get("markets", [])
-
-        def get_h2h(mkts_local):
-            d = {}
-            for m in mkts_local:
-                if m.get("key") == "h2h":
-                    for o in m.get("outcomes", []):
-                        d[o.get("name")] = o.get("price")
-            return d
-
-        def get_spreads(mkts_local):
-            d = {}
-            for m in mkts_local:
-                if m.get("key") == "spreads":
-                    for o in m.get("outcomes", []):
-                        d[o.get("name")] = {"point": o.get("point"), "price": o.get("price")}
-            return d
-
-        def get_totals(mkts_local):
-            arr = []
-            for m in mkts_local:
-                if m.get("key") == "totals":
-                    for o in m.get("outcomes", []):
-                        arr.append({"team": o.get("name"), "point": o.get("point"), "price": o.get("price")})
-            if len(arr) == 2:
-                arr.sort(key=lambda x: 0 if (x["team"] or "").lower().startswith("over") else 1)
-            return arr
-
         h2h = get_h2h(mkts)
         spreads = get_spreads(mkts)
         totals = get_totals(mkts)
@@ -283,7 +300,7 @@ def odds():
         # ---- Totals opening + diff (points only) ----
         tot_rows = []
         for row in totals:
-            ou_lab = row.get("team")
+            ou_lab = row.get("team")  # "Over" or "Under"
             lp = row.get("point")
             lprice = row.get("price")
             open_point = None
@@ -310,7 +327,7 @@ def odds():
             })
 
         games.append({
-            "event_id": event_id,
+            "event_id": ev.get("id"),
             "sport": sport,
             "away_team": away,
             "home_team": home,
